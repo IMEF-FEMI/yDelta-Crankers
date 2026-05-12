@@ -1,0 +1,20 @@
+# Railway service config for ydelta-crankers.
+#
+# Crankers is a standalone repo. Connect it directly; the build context
+# is the repo root and the Dockerfile sits at the root too. The ydelta
+# program crate is pulled in as a git dep at the rev pinned in
+# Cargo.toml — no sibling directories required.
+#
+# Reference: https://docs.railway.app/reference/config-as-code
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# Bot is a worker, not a web service — no public port. Railway will
+# show "no exposed port" warnings; ignore.
+restartPolicyType = "ALWAYS"
+restartPolicyMaxRetries = 10
+# Bot binds nothing; the start command is the image's ENTRYPOINT.
+startCommand = ""

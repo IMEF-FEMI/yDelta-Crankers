@@ -1,0 +1,8 @@
+/target
+.env
+.env.*
+!.env.example
+/secrets
+*.json
+!Cargo.lock.json
+.local/

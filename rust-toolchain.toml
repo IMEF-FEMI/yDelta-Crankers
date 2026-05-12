@@ -1,0 +1,6 @@
+[toolchain]
+# Host-side build only — cranker doesn't compile to SBF, so we can ride
+# stable instead of pinning to the SBF toolchain. 1.85+ is required for
+# `edition2024` which transitively appears under `blake3` → `constant_time_eq`
+# pulled by `solana-zk-sdk 2.3.x`.
+channel = "1.90.0"

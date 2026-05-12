@@ -1,0 +1,65 @@
+[package]
+name = "ydelta-crankers"
+version = "0.1.0"
+edition = "2021"
+description = "Off-chain keeper bots for the yDelta protocol"
+publish = false
+
+[[bin]]
+name = "ydelta-crankers"
+path = "src/main.rs"
+
+[dependencies]
+# Reuse the program crate for ix builders, account types, PDA helpers.
+# `no-entrypoint` strips `solana_program::entrypoint!` so we link as a
+# plain lib. Resolved as a git dep (not a path dep) so crankers is a
+# self-contained repo deployable on its own — Railway / any CI just
+# needs to be able to clone the public IMEF-FEMI/yDelta repo. The
+# `workspace = true` references inside ydelta resolve against ydelta's
+# own [workspace], not ours.
+#
+# Pinned to a specific commit; bump when ydelta ships a change the
+# cranker needs. To update: edit the `rev` here and re-run `cargo
+# build` (Cargo.lock regenerates the relevant entries automatically).
+ydelta = { git = "https://github.com/IMEF-FEMI/yDelta.git", rev = "2aa1a940f1966796f7532226b092277f1bd9f6a8", features = ["no-entrypoint"] }
+hypertree = { git = "https://github.com/IMEF-FEMI/yDelta.git", rev = "2aa1a940f1966796f7532226b092277f1bd9f6a8" }
+
+# Solana client + signing. Match ydelta's pinned 2.2.x family so the
+# Pubkey / Instruction types unify across the path boundary.
+solana-program = "=2.2"
+solana-sdk = "~2.2.0"
+solana-client = "~2.2.0"
+
+# Account decoding (MarketFixed read path).
+bytemuck = { version = "1.7.2", features = ["derive"] }
+borsh = "=0.10"
+
+# Runtime.
+tokio = { version = "1.28", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "1"
+
+# Async trait dispatch.
+async-trait = "0.1"
+
+# Observability.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Metrics — Prometheus exposition over a small HTTP listener.
+# Grafana Cloud scrapes the public /metrics endpoint.
+metrics = "0.23"
+metrics-exporter-prometheus = { version = "0.15", default-features = false, features = ["http-listener"] }
+
+# Config + utilities.
+dotenvy = "0.15"
+bs58 = "0.5"
+base64 = "0.22"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+strip = "debuginfo"
