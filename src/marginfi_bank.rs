@@ -6,9 +6,16 @@
 //! offsets here.
 //!
 //! Source of truth: the v0.1.8 IDL at
-//! `ydelta/programs/ydelta/tests/fixtures/marginfi.idl.json`. Offsets
-//! derived directly from the layout comment in
-//! `marginfi-mocks/src/state.rs`.
+//! `ydelta/programs/ydelta/tests/fixtures/marginfi.idl.json` for the
+//! legacy three-point fields, plus
+//! `references/marginfi-v2/type-crate/src/types/interest_rate.rs` for
+//! the seven-point multipoint curve fields (`zero_util_rate`,
+//! `hundred_util_rate`, `points`, `curve_type`) that the on-chain
+//! `InterestRateConfig` carries from v1.6+. Mainnet banks have all
+//! migrated to `curve_type = 1` (seven-point), so the legacy
+//! `optimal_utilization_rate / plateau / max_interest_rate` fields are
+//! zero — the decoder must read both sets and the evaluator must
+//! branch on `curve_type`.
 
 use anyhow::{anyhow, Result};
 use solana_program::pubkey::Pubkey;
@@ -43,14 +50,19 @@ pub const BANK_BODY_SIZE: usize = 1856;
 //   ... (rest unused by the cranker)
 //
 // Within `InterestRateConfig` (start = body offset 360):
-//   optimal_utilization_rate     (16) → 360..376
-//   plateau_interest_rate        (16) → 376..392
-//   max_interest_rate            (16) → 392..408
+//   optimal_utilization_rate     (16) → 360..376    [legacy, zero on v2 banks]
+//   plateau_interest_rate        (16) → 376..392    [legacy]
+//   max_interest_rate            (16) → 392..408    [legacy]
 //   insurance_fee_fixed_apr      (16) → 408..424
 //   insurance_ir_fee             (16) → 424..440
 //   protocol_fixed_fee_apr       (16) → 440..456
 //   protocol_ir_fee              (16) → 456..472
-//   (padding to 600                  ) → 472..600
+//   protocol_origination_fee     (16) → 472..488
+//   zero_util_rate               ( 4) → 488..492    [seven-point]
+//   hundred_util_rate            ( 4) → 492..496    [seven-point]
+//   points: [{util: u32, rate: u32}; 5] (40) → 496..536  [seven-point]
+//   curve_type                   ( 1) → 536..537    0 = legacy, 1 = seven-point
+//   _pad0 + _padding1..3              → 537..600
 const OFF_MINT: usize = 0;
 const OFF_ASSET_SHARE_VALUE: usize = 72;
 const OFF_LIABILITY_SHARE_VALUE: usize = 88;
@@ -66,6 +78,15 @@ const OFF_OPTIMAL_UTIL: usize = OFF_INTEREST_RATE_CONFIG;
 const OFF_PLATEAU: usize = OFF_INTEREST_RATE_CONFIG + 16;
 const OFF_MAX_IR: usize = OFF_INTEREST_RATE_CONFIG + 32;
 const OFF_PROTOCOL_IR_FEE: usize = OFF_INTEREST_RATE_CONFIG + 96;
+
+const OFF_ZERO_UTIL_RATE: usize = OFF_INTEREST_RATE_CONFIG + 128;
+const OFF_HUNDRED_UTIL_RATE: usize = OFF_INTEREST_RATE_CONFIG + 132;
+const OFF_POINTS: usize = OFF_INTEREST_RATE_CONFIG + 136;
+const OFF_CURVE_TYPE: usize = OFF_INTEREST_RATE_CONFIG + 176;
+const NUM_CURVE_POINTS: usize = 5;
+
+pub const INTEREST_CURVE_LEGACY: u8 = 0;
+pub const INTEREST_CURVE_SEVEN_POINT: u8 = 1;
 
 const OFF_ORACLE_SETUP: usize = BANK_CONFIG_OFFSET + 313;
 const OFF_ORACLE_KEYS: usize = BANK_CONFIG_OFFSET + 314;
@@ -91,12 +112,28 @@ pub struct BankView {
     pub liability_share_value_fp48: i128,
     pub total_asset_shares_fp48: i128,
     pub total_liability_shares_fp48: i128,
-    /// All four IR-curve params are fp48 fractions (e.g. 0.8 = `0.8 << 48`).
+    /// Legacy three-point curve params. fp48 fractions. Zero on v2
+    /// banks that have migrated to the seven-point curve — check
+    /// [`curve_type`](Self::curve_type) before using.
     pub optimal_utilization_fp48: i128,
     pub plateau_interest_rate_fp48: i128,
     pub max_interest_rate_fp48: i128,
     /// fp48 fraction. APR multiplier deducted from supply yield.
     pub protocol_ir_fee_fp48: i128,
+    /// `0` = legacy three-point curve, `1` = seven-point multipoint
+    /// curve. v2 mainnet banks all run on `1`.
+    pub curve_type: u8,
+    /// Multipoint curve: base rate at utilization = 0. Encoded as
+    /// `(rate / u32::MAX) × 1000%`, so `u32::MAX/10 ≈ 100% APR`.
+    pub zero_util_rate_u32: u32,
+    /// Multipoint curve: base rate at utilization = 100%. Same encoding
+    /// as [`zero_util_rate_u32`](Self::zero_util_rate_u32).
+    pub hundred_util_rate_u32: u32,
+    /// Up to 5 interior kink points. Each `(util, rate)` u32 pair is
+    /// encoded with util as `u / u32::MAX = 0..1` and rate as
+    /// `(r / u32::MAX) × 1000%`. Points where `util == 0` are inactive
+    /// and skipped by the evaluator.
+    pub points: [(u32, u32); NUM_CURVE_POINTS],
     pub oracle_setup: u8,
     /// Up to 5 oracle pubkeys; trailing default-zero entries are dropped.
     pub oracles: Vec<Pubkey>,
@@ -130,6 +167,16 @@ impl BankView {
         let max_interest_rate_fp48 = read_i128(body, OFF_MAX_IR);
         let protocol_ir_fee_fp48 = read_i128(body, OFF_PROTOCOL_IR_FEE);
 
+        let curve_type = body[OFF_CURVE_TYPE];
+        let zero_util_rate_u32 = read_u32(body, OFF_ZERO_UTIL_RATE);
+        let hundred_util_rate_u32 = read_u32(body, OFF_HUNDRED_UTIL_RATE);
+        let mut points = [(0u32, 0u32); NUM_CURVE_POINTS];
+        for i in 0..NUM_CURVE_POINTS {
+            let util = read_u32(body, OFF_POINTS + i * 8);
+            let rate = read_u32(body, OFF_POINTS + i * 8 + 4);
+            points[i] = (util, rate);
+        }
+
         let oracle_setup = body[OFF_ORACLE_SETUP];
         let mut oracles = Vec::with_capacity(MAX_ORACLE_KEYS);
         for i in 0..MAX_ORACLE_KEYS {
@@ -151,6 +198,10 @@ impl BankView {
             plateau_interest_rate_fp48,
             max_interest_rate_fp48,
             protocol_ir_fee_fp48,
+            curve_type,
+            zero_util_rate_u32,
+            hundred_util_rate_u32,
+            points,
             oracle_setup,
             oracles,
         })
@@ -165,4 +216,9 @@ fn read_pubkey(body: &[u8], off: usize) -> Pubkey {
 fn read_i128(body: &[u8], off: usize) -> i128 {
     let bytes: [u8; 16] = body[off..off + 16].try_into().unwrap();
     i128::from_le_bytes(bytes)
+}
+
+fn read_u32(body: &[u8], off: usize) -> u32 {
+    let bytes: [u8; 4] = body[off..off + 4].try_into().unwrap();
+    u32::from_le_bytes(bytes)
 }
