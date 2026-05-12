@@ -21,8 +21,8 @@ path = "src/main.rs"
 # Pinned to a specific commit; bump when ydelta ships a change the
 # cranker needs. To update: edit the `rev` here and re-run `cargo
 # build` (Cargo.lock regenerates the relevant entries automatically).
-ydelta = { git = "https://github.com/IMEF-FEMI/yDelta.git", rev = "357c758fceab6bc537c3a6a566f0e711ce8331b5", features = ["no-entrypoint"] }
-hypertree = { git = "https://github.com/IMEF-FEMI/yDelta.git", rev = "357c758fceab6bc537c3a6a566f0e711ce8331b5" }
+ydelta = { git = "https://github.com/IMEF-FEMI/yDelta.git", rev = "68f174042637a99b8025ed2c0ef60d4c20357659", features = ["no-entrypoint"] }
+hypertree = { git = "https://github.com/IMEF-FEMI/yDelta.git", rev = "68f174042637a99b8025ed2c0ef60d4c20357659" }
 
 # Solana client + signing. Match ydelta's pinned 2.2.x family so the
 # Pubkey / Instruction types unify across the path boundary.
@@ -73,10 +73,13 @@ codegen-units = 1
 lto = "fat"
 strip = "debuginfo"
 
-# Local-dev override: when ydelta is being edited in the sibling
-# `../ydelta` checkout, point both ydelta and hypertree at the local
-# crates so the cranker picks up unpushed changes. Remove (or bump the
-# `rev` above) once the ydelta change is merged + tagged.
-[patch."https://github.com/IMEF-FEMI/yDelta.git"]
-ydelta = { path = "../ydelta/programs/ydelta" }
-hypertree = { path = "../ydelta/lib" }
+# To test against an unpushed ydelta change locally, uncomment the
+# block below. Keep it commented in committed builds — Railway's
+# Dockerfile only copies this crate, so the sibling `../ydelta` path
+# doesn't exist there and Cargo would fail with "Unable to update
+# /ydelta/lib". After pushing the ydelta change, bump the `rev` on the
+# `ydelta` / `hypertree` deps above instead.
+#
+# [patch."https://github.com/IMEF-FEMI/yDelta.git"]
+# ydelta = { path = "../ydelta/programs/ydelta" }
+# hypertree = { path = "../ydelta/lib" }
