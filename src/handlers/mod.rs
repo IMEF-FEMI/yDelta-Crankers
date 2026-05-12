@@ -1,9 +1,9 @@
 //! Handler trait + supervisor.
 //!
 //! Each handler runs its own loop on its own interval, sharing the RPC,
-//! indexer, and signer references. A shared `stop` atomic propagates
-//! sigterm/sigint to every loop. Failures inside a tick log + sleep +
-//! continue; we never let one bad tick crash the whole bot.
+//! chain reader, and signer references. A shared `stop` atomic
+//! propagates sigterm/sigint to every loop. Failures inside a tick log
+//! + sleep + continue; we never let one bad tick crash the whole bot.
 
 use std::{
     sync::{atomic::AtomicBool, Arc},
@@ -13,7 +13,7 @@ use std::{
 use async_trait::async_trait;
 use tokio::task::JoinHandle;
 
-use crate::{indexer_client::IndexerClient, rpc::Rpc, signer::Signers};
+use crate::{chain_reader::ChainReader, rpc::Rpc, signer::Signers};
 
 pub mod claimer;
 pub mod curator_keeper;
@@ -27,7 +27,7 @@ pub mod util;
 pub struct HandlerContext {
     pub cfg: Arc<crate::config::Config>,
     pub rpc: Rpc,
-    pub indexer: IndexerClient,
+    pub chain: ChainReader,
     pub signers: Signers,
     pub stop: Arc<AtomicBool>,
     /// Set when fee-payer balance drops below

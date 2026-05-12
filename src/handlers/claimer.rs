@@ -1,8 +1,10 @@
 //! `ClaimRepaymentForRiskProfile` (tag 24) — drains repaid vault loans
 //! back to the GlobalVault.
 //!
-//! Discovery: for each (vault, profile) we manage (config-driven), poll
-//! the indexer for the profile's loans, client-side filter to
+//! Discovery: for each (vault, profile) we manage (config-driven), pull
+//! loans straight from chain via `ChainReader::list_loans_for_profile`
+//! (a single `getProgramAccounts` per profile, filtered by
+//! `LoanFixed.lender_global_vault` + `lender_profile_id`), filter to
 //! `state == Repaid && now >= matures_at_unix`, fire the claim ix.
 //!
 //! Pass our fee-payer as `cranker_refund` — the on-chain processor
@@ -10,22 +12,21 @@
 //! Same wallet that runs the promoter handler runs the claimer →
 //! rent-neutral pipeline.
 
-use std::{collections::HashSet, str::FromStr, sync::Mutex};
+use std::{collections::HashSet, sync::Mutex};
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use solana_program::pubkey::Pubkey;
 use solana_sdk::signature::Signer as _;
 use ydelta::program::instruction_builders::claim_repayment_for_risk_profile_instruction;
+use ydelta::state::loan::LoanState;
+use ydelta::state::OWNER_KIND_RISK_PROFILE;
 use ydelta::validation::get_lender_integration_account_address;
 
-use crate::indexer_client::{LoanSummary, LoansQuery};
+use crate::chain_reader::LoanView;
 
 use super::util::now_unix;
 use super::{Handler, HandlerContext};
-
-const LOAN_STATE_REPAID: i16 = 1;
-const LENDER_KIND_RISK_PROFILE: i16 = 1;
 
 pub struct ClaimerHandler {
     /// (vault, profile_id) targets discovered at first tick from the
@@ -102,20 +103,14 @@ impl ClaimerHandler {
         now_unix: i64,
     ) -> Result<usize> {
         let loans = ctx
-            .indexer
-            .loans(LoansQuery {
-                vault: Some(vault),
-                profile_id: Some(profile_id),
-                state: Some("all"),
-                limit: Some(200),
-                ..Default::default()
-            })
+            .chain
+            .list_loans_for_profile(vault, profile_id)
             .await?;
 
-        let candidates: Vec<&LoanSummary> = loans
+        let candidates: Vec<&LoanView> = loans
             .iter()
-            .filter(|l| l.state == LOAN_STATE_REPAID)
-            .filter(|l| l.lender_kind == LENDER_KIND_RISK_PROFILE)
+            .filter(|l| l.state == LoanState::Repaid as u8)
+            .filter(|l| l.lender_kind == OWNER_KIND_RISK_PROFILE)
             .filter(|l| now_unix >= l.matures_at_unix)
             .collect();
 
@@ -125,7 +120,7 @@ impl ClaimerHandler {
 
         let mut claimed = 0;
         for c in candidates {
-            let loan_pk = c.address.parse::<Pubkey>()?;
+            let loan_pk = c.address;
             if !self.claim_inflight(loan_pk) {
                 continue;
             }
@@ -153,29 +148,22 @@ impl ClaimerHandler {
         &self,
         ctx: &HandlerContext,
         vault: &Pubkey,
-        loan: &LoanSummary,
+        loan: &LoanView,
     ) -> Result<()> {
-        let loan_pk = Pubkey::from_str(&loan.address)?;
-        // Need `matched_loan_sequence` to derive the loan PDA — only the
-        // full loan view carries it. One extra round-trip per claim;
-        // we'd batch via a `?include=full` query if it becomes hot.
-        let full = ctx.indexer.loan(&loan_pk).await?;
-        let sequence = u64::try_from(full.matched_loan_sequence).map_err(|_| {
-            anyhow!(
-                "negative matched_loan_sequence: {}",
-                full.matched_loan_sequence
-            )
-        })?;
+        // `matched_loan_sequence` already lives on the `LoanFixed`
+        // header, so the chain-side `LoanView` carries it natively —
+        // no extra read needed.
+        let sequence = loan.matched_loan_sequence;
 
-        let market_pk = Pubkey::from_str(&loan.market)?;
+        let market_pk = loan.market;
         let market_view = ctx
-            .indexer
-            .markets()
+            .chain
+            .list_markets()
             .await?
             .into_iter()
-            .find(|m| m.address == loan.market)
-            .ok_or_else(|| anyhow!("market {} not in indexer", loan.market))?;
-        let debt_mint = Pubkey::from_str(&market_view.debt_mint)?;
+            .find(|m| m.address == market_pk)
+            .ok_or_else(|| anyhow!("market {market_pk} not found on chain"))?;
+        let debt_mint = market_view.debt_mint;
         let debt_bank = ctx
             .cfg
             .banks

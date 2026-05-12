@@ -1,9 +1,9 @@
 //! `ProcessMatchedLoan` (tag 7) — promote queue nodes into LoanFixed PDAs.
 //!
-//! Reads `MarketFixed` accounts via RPC (the indexer doesn't expose the
-//! MatchedLoan queue), walks the hypertree, and submits one ix per
-//! pending node. Cranker pays loan-PDA rent; recovered at claim time
-//! when the lender (or our claimer handler) passes us as `cranker_refund`.
+//! Walks `MarketFixed` accounts via RPC (via `ChainReader`) to find the
+//! MatchedLoan queue, then submits one ix per pending node. Cranker
+//! pays loan-PDA rent; recovered at claim time when the lender (or
+//! our claimer handler) passes us as `cranker_refund`.
 //!
 //! Modes (driven by `MatchedLoan.flags`):
 //!   - Primary       → empty loan PDA, builds via `process_matched_loan_instruction`
@@ -33,8 +33,7 @@ use ydelta::state::vault::{
 use ydelta::validation::token_checkers::get_vault_address;
 use ydelta::validation::{get_lender_integration_account_address, get_market_signer_address};
 
-use crate::indexer_client::MarketSummary;
-use crate::market_reader::{read_pending_matched_loans, read_seat_at, PendingMatchedLoan};
+use crate::chain_reader::{MarketView, PendingMatchedLoan};
 use ydelta::state::OWNER_KIND_RISK_PROFILE;
 
 use super::{Handler, HandlerContext};
@@ -61,7 +60,7 @@ impl Handler for PromoterHandler {
 
     async fn tick(&self, ctx: &HandlerContext) -> Result<()> {
         let t0 = Instant::now();
-        let markets = ctx.indexer.markets().await?;
+        let markets = ctx.chain.list_markets().await?;
         let mut total_pending = 0usize;
         let mut promoted = 0usize;
 
@@ -69,8 +68,8 @@ impl Handler for PromoterHandler {
             if m.is_paused {
                 continue;
             }
-            let market_pk = m.address.parse::<Pubkey>()?;
-            let pending = match read_pending_matched_loans(&ctx.rpc, &market_pk).await {
+            let market_pk = m.address;
+            let pending = match ctx.chain.read_pending_matched_loans(&market_pk).await {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!(market = %market_pk, error = %e, "read pending failed");
@@ -124,12 +123,12 @@ impl PromoterHandler {
     async fn promote_one(
         &self,
         ctx: &HandlerContext,
-        market: &MarketSummary,
+        market: &MarketView,
         entry: &PendingMatchedLoan,
     ) -> Result<bool> {
-        let market_pk: Pubkey = market.address.parse()?;
-        let debt_mint: Pubkey = market.debt_mint.parse()?;
-        let collateral_mint: Pubkey = market.collateral_mint.parse()?;
+        let market_pk = market.address;
+        let debt_mint = market.debt_mint;
+        let collateral_mint = market.collateral_mint;
 
         let debt_bank = ctx
             .cfg
@@ -250,7 +249,7 @@ impl PromoterHandler {
             .get_account_data(market)
             .await?
             .ok_or_else(|| anyhow!("market {market} disappeared"))?;
-        let new_lender_seat = read_seat_at(&market_data, entry.new_lender_seat_index)?;
+        let new_lender_seat = ctx.chain.read_seat_at(&market_data, entry.new_lender_seat_index)?;
         if new_lender_seat.owner_kind != OWNER_KIND_RISK_PROFILE {
             return Ok(None);
         }
@@ -272,7 +271,7 @@ impl PromoterHandler {
             .get_account_data(market)
             .await?
             .ok_or_else(|| anyhow!("market {market} disappeared"))?;
-        let seat = read_seat_at(&market_data, entry.new_lender_seat_index)?;
+        let seat = ctx.chain.read_seat_at(&market_data, entry.new_lender_seat_index)?;
         Ok(seat.owner_kind == OWNER_KIND_RISK_PROFILE)
     }
 
@@ -300,7 +299,7 @@ impl PromoterHandler {
             .get_account_data(market)
             .await?
             .ok_or_else(|| anyhow!("market {market} disappeared"))?;
-        let seat = read_seat_at(&market_data, entry.lender_seat_index)?;
+        let seat = ctx.chain.read_seat_at(&market_data, entry.lender_seat_index)?;
         let global_vault = seat.owner;
         self.build_vault_settle_addrs(ctx, market, &global_vault, debt_mint, debt_bank)
     }

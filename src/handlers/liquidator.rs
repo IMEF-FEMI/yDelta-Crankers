@@ -1,7 +1,8 @@
 //! `SettleMaturedLoan` (tag 20) + `LiquidateLoan` (tag 21).
 //!
-//! Discovery: indexer `/v1/loans?state=active` for each market we know
-//! about. For each loan:
+//! Discovery: `ChainReader::list_loans_for_market` per known market.
+//! That's a single `getProgramAccounts(LoanFixed)` filtered by market
+//! pubkey — no indexer round-trip. For each loan:
 //!   - Compute the static (oracle-free) collateral/debt ratio and skip
 //!     obviously-overcollateralized loans to save sim cost.
 //!   - Pre-flight via `CheckMaturityLiquidatable` (tag 41) or
@@ -18,7 +19,7 @@
 //!   - Bank info for both mints (auto-discovered at boot from each
 //!     market's `MarketFixed` account; see `bank_registry.rs`).
 
-use std::{collections::HashSet, str::FromStr, sync::Mutex};
+use std::{collections::HashSet, sync::Mutex};
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -28,13 +29,14 @@ use ydelta::program::instruction_builders::{
     check_ltv_liquidatable_instruction, check_maturity_liquidatable_instruction,
     liquidate_loan_instruction, settle_matured_loan_instruction,
 };
+use ydelta::state::loan::LoanState;
 
-use crate::indexer_client::{LoanSummary, LoansQuery, MarketSummary};
+use crate::chain_reader::{LoanView, MarketView};
 
 use super::util::now_unix;
 use super::{Handler, HandlerContext};
 
-const LOAN_STATE_ACTIVE: i16 = 0;
+const LOAN_STATE_ACTIVE: u8 = LoanState::Active as u8;
 /// Static LTV pre-filter — only loans above this static debt/collateral
 /// ratio (atom-based, no oracle adjustment) are worth simulating.
 /// Generous floor; the real LTV gate happens in the sim.
@@ -59,7 +61,7 @@ impl Handler for LiquidatorHandler {
     }
 
     async fn tick(&self, ctx: &HandlerContext) -> Result<()> {
-        let markets = ctx.indexer.markets().await?;
+        let markets = ctx.chain.list_markets().await?;
         let mut total = 0usize;
         for market in &markets {
             if market.is_paused {
@@ -80,17 +82,9 @@ impl Handler for LiquidatorHandler {
 }
 
 impl LiquidatorHandler {
-    async fn scan_market(&self, ctx: &HandlerContext, market: &MarketSummary) -> Result<usize> {
-        let market_pk = Pubkey::from_str(&market.address)?;
-        let loans = ctx
-            .indexer
-            .loans(LoansQuery {
-                market: Some(&market_pk),
-                state: Some("active"),
-                limit: Some(500),
-                ..Default::default()
-            })
-            .await?;
+    async fn scan_market(&self, ctx: &HandlerContext, market: &MarketView) -> Result<usize> {
+        let market_pk = market.address;
+        let loans = ctx.chain.list_loans_for_market(&market_pk).await?;
 
         let t_now = now_unix();
         let grace_buffer = ctx.cfg.thresholds.maturity_extra_buffer.as_secs() as i64;
@@ -100,7 +94,7 @@ impl LiquidatorHandler {
             if loan.state != LOAN_STATE_ACTIVE {
                 continue;
             }
-            if loan.outstanding_debt_atoms <= 0 {
+            if loan.outstanding_debt_atoms == 0 {
                 continue;
             }
             // Cheap static prefilter — don't pay for sims on obviously
@@ -115,7 +109,7 @@ impl LiquidatorHandler {
                 continue;
             }
 
-            let loan_pk = Pubkey::from_str(&loan.address)?;
+            let loan_pk = loan.address;
             if !self.claim_inflight(loan_pk) {
                 continue;
             }
@@ -148,17 +142,16 @@ impl LiquidatorHandler {
     async fn try_settle_matured(
         &self,
         ctx: &HandlerContext,
-        market: &MarketSummary,
-        loan: &LoanSummary,
+        market: &MarketView,
+        loan: &LoanView,
     ) -> Result<bool> {
-        let market_pk = Pubkey::from_str(&market.address)?;
-        let debt_mint = Pubkey::from_str(&market.debt_mint)?;
-        let collateral_mint = Pubkey::from_str(&market.collateral_mint)?;
+        let market_pk = market.address;
+        let debt_mint = market.debt_mint;
+        let collateral_mint = market.collateral_mint;
 
         let (debt_bank, collateral_bank) = self.banks(ctx, &debt_mint, &collateral_mint)?;
 
-        let full = ctx.indexer.loan(&Pubkey::from_str(&loan.address)?).await?;
-        let sequence = u64::try_from(full.matched_loan_sequence)?;
+        let sequence = loan.matched_loan_sequence;
 
         let fee_payer = ctx.signers.fee_payer.clone();
         let payer_pk = fee_payer.pubkey();
@@ -222,17 +215,16 @@ impl LiquidatorHandler {
     async fn try_liquidate_ltv(
         &self,
         ctx: &HandlerContext,
-        market: &MarketSummary,
-        loan: &LoanSummary,
+        market: &MarketView,
+        loan: &LoanView,
     ) -> Result<bool> {
-        let market_pk = Pubkey::from_str(&market.address)?;
-        let debt_mint = Pubkey::from_str(&market.debt_mint)?;
-        let collateral_mint = Pubkey::from_str(&market.collateral_mint)?;
+        let market_pk = market.address;
+        let debt_mint = market.debt_mint;
+        let collateral_mint = market.collateral_mint;
 
         let (debt_bank, collateral_bank) = self.banks(ctx, &debt_mint, &collateral_mint)?;
 
-        let full = ctx.indexer.loan(&Pubkey::from_str(&loan.address)?).await?;
-        let sequence = u64::try_from(full.matched_loan_sequence)?;
+        let sequence = loan.matched_loan_sequence;
 
         let fee_payer = ctx.signers.fee_payer.clone();
         let payer_pk = fee_payer.pubkey();
@@ -255,8 +247,8 @@ impl LiquidatorHandler {
         }
 
         // Profit gate (heuristic — refine once we read fee_config bonus
-        // bps from indexer).
-        if (loan.outstanding_debt_atoms as u64) < ctx.cfg.thresholds.min_liquidation_profit_atoms {
+        // bps from the market account).
+        if loan.outstanding_debt_atoms < ctx.cfg.thresholds.min_liquidation_profit_atoms {
             tracing::debug!(loan = %loan.address, "below min liquidation profit");
             return Ok(false);
         }
@@ -320,8 +312,8 @@ impl LiquidatorHandler {
 
 /// Static debt/principal ratio in bps. Cheap pre-filter only — the real
 /// LTV gate is oracle-priced and runs in the sim.
-fn static_ltv_bps(outstanding_debt_atoms: i64, principal_debt_atoms: i64) -> u32 {
-    if principal_debt_atoms <= 0 {
+fn static_ltv_bps(outstanding_debt_atoms: u64, principal_debt_atoms: u64) -> u32 {
+    if principal_debt_atoms == 0 {
         return 0;
     }
     let ratio = (outstanding_debt_atoms as f64 / principal_debt_atoms as f64) * 10_000.0;

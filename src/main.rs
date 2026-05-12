@@ -1,31 +1,20 @@
-//! Entrypoint. Loads config, signers, RPC, indexer; verifies external
-//! deps are reachable; spawns enabled handlers; awaits sigterm.
+//! Entrypoint. Loads config, signers, RPC; verifies the chain endpoint
+//! is reachable; spawns enabled handlers; awaits sigterm.
 
 use std::sync::{atomic::AtomicBool, Arc};
 
 use anyhow::{Context, Result};
 use tracing_subscriber::EnvFilter;
 
-mod bank_registry;
-mod config;
-mod handlers;
-mod health_server;
-mod indexer_client;
-mod marginfi_bank;
-mod marginfi_rate;
-mod market_reader;
-mod metrics;
-mod rpc;
-mod signer;
-
-use config::{redact_url, Config};
-use handlers::{
+use ydelta_crankers::chain_reader::ChainReader;
+use ydelta_crankers::config::{redact_url, Config};
+use ydelta_crankers::handlers::{
     spawn, ClaimerHandler, CuratorKeeperHandler, HandlerContext, LiquidatorHandler,
     PolicySyncHandler, PromoterHandler,
 };
-use indexer_client::IndexerClient;
-use rpc::Rpc;
-use signer::Signers;
+use ydelta_crankers::rpc::Rpc;
+use ydelta_crankers::signer::Signers;
+use ydelta_crankers::{health_server, metrics};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -34,7 +23,7 @@ async fn main() -> Result<()> {
     tracing::info!("ydelta-crankers starting");
 
     let mut cfg = Config::from_env()?;
-    // RPC + indexer URLs go through `redact_url` so embedded API keys
+    // The RPC URL goes through `redact_url` so embedded API keys
     // (Helius / Triton / Quicknode all use `?api-key=…`) and any
     // basic-auth userinfo don't end up in Railway log streams.
     tracing::info!(
@@ -42,7 +31,6 @@ async fn main() -> Result<()> {
         program_id = %cfg.program_id,
         marginfi_group = %cfg.marginfi_group,
         rpc = %redact_url(&cfg.rpc_url),
-        indexer = %redact_url(&cfg.indexer_base_url),
         "config loaded"
     );
 
@@ -51,19 +39,19 @@ async fn main() -> Result<()> {
     let signers = Signers::load(&cfg)?;
     let rpc = Rpc::new(cfg.rpc_url.clone(), cfg.priority_fee_micro_lamports)
         .with_stop_signal(stop.clone());
-    let indexer = IndexerClient::new(cfg.indexer_base_url.clone());
+    let chain = ChainReader::new(rpc.clone(), cfg.program_id);
 
     // Discover marginfi bank metadata at boot: walk every market the
-    // indexer surfaces, read each market's `MarketFixed` on chain,
-    // extract its (debt_bank, collateral_bank) pubkeys, then resolve
-    // each unique bank's full metadata from chain. No env input — the
-    // operator can't typo what they don't enter.
-    cfg.discover_banks_from_markets(&rpc, &indexer)
+    // chain reader surfaces, pull `(debt_bank, collateral_bank)` from
+    // each `MarketFixed`, then resolve each unique bank's full
+    // metadata from chain. No env input — the operator can't typo what
+    // they don't enter.
+    cfg.discover_banks_from_markets(&rpc, &chain)
         .await
         .context("discover_banks_from_markets failed")?;
     tracing::info!(
         banks = cfg.banks.len(),
-        "discovered marginfi banks from indexer markets",
+        "discovered marginfi banks from on-chain markets",
     );
 
     // Bootstrap the fee-payer's SPL ATAs for every bank's mint. Uses
@@ -101,8 +89,6 @@ async fn main() -> Result<()> {
     tracing::info!(addr = %health_bind, "health endpoints listening (/healthz, /readyz)");
 
     // Boot-time connectivity checks. Fail fast on misconfig.
-    indexer.health().await?;
-    tracing::info!("indexer health OK");
     let slot = rpc.client().get_slot().await?;
     tracing::info!(slot, "rpc reachable");
 
@@ -124,7 +110,7 @@ async fn main() -> Result<()> {
     let ctx = HandlerContext {
         cfg: cfg.clone(),
         rpc: rpc.clone(),
-        indexer,
+        chain,
         signers: signers.clone(),
         stop: stop.clone(),
         fee_payer_low: fee_payer_low.clone(),

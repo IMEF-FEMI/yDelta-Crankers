@@ -1,11 +1,13 @@
 //! Per-mint marginfi-bank metadata.
 //!
 //! No env input. The cranker discovers every bank it cares about by:
-//!   1. Listing markets from the indexer.
-//!   2. Reading each `MarketFixed` account on chain to pull the four
-//!      pubkeys it stores natively: `debt_mint`, `debt_lending_pool`,
-//!      `collateral_mint`, `collateral_lending_pool` (the two
-//!      `*_lending_pool` fields are the marginfi `Bank` pubkeys).
+//!   1. Listing markets on chain via `ChainReader::list_markets`
+//!      (a single `getProgramAccounts` against the ydelta program id
+//!      filtered by the `MarketFixed` discriminator).
+//!   2. Reading each `MarketFixed` to pull the four pubkeys it stores
+//!      natively: `debt_mint`, `debt_lending_pool`, `collateral_mint`,
+//!      `collateral_lending_pool` (the two `*_lending_pool` fields are
+//!      the marginfi `Bank` pubkeys).
 //!   3. De-duplicating across markets and reading each unique `Bank`
 //!      account to extract `liquidity_vault`, the LVA bump, and the
 //!      oracle list. The LVA pubkey is derived from the bump via the
@@ -17,7 +19,8 @@
 //! PDAs of `(owner, token_program, mint)` — derived on demand via
 //! `BankInfo::ata_for`. No env config for those either.
 
-use std::{collections::HashMap, str::FromStr};
+use std::collections::HashMap;
+use std::str::FromStr;
 
 use anyhow::{anyhow, bail, Context, Result};
 use solana_client::nonblocking::rpc_client::RpcClient;
@@ -28,9 +31,8 @@ use solana_sdk::{
     system_program,
 };
 
-use crate::indexer_client::IndexerClient;
+use crate::chain_reader::ChainReader;
 use crate::marginfi_bank::BankView;
-use crate::market_reader::{read_market_bank_bindings, MarketBankBindings};
 use crate::rpc::Rpc;
 
 /// SPL Associated Token Account program id. Constant across mainnet +
@@ -114,52 +116,46 @@ impl BankRegistry {
     ///      chain-reading path.
     pub async fn discover_from_markets(
         rpc: &Rpc,
-        indexer: &IndexerClient,
+        chain: &ChainReader,
         marginfi_program: &Pubkey,
     ) -> Result<Self> {
-        let markets = indexer
-            .markets()
+        // One `getProgramAccounts(MarketFixed)` returns every market on
+        // chain, fully decoded, in a single RPC round-trip — no per-
+        // market follow-up read needed.
+        let markets = chain
+            .refresh_markets()
             .await
-            .context("BANKS discover: indexer.markets() failed")?;
+            .context("BANKS discover: ChainReader::refresh_markets failed")?;
         if markets.is_empty() {
-            tracing::warn!("BANKS discover: indexer returned 0 markets; bot will idle");
+            tracing::warn!("BANKS discover: chain returned 0 markets; bot will idle");
             return Ok(Self::default());
         }
 
-        // Walk each market on chain to pull its (mint, bank) pairs. We
-        // can't trust the indexer for these specifically — they live on
-        // `MarketFixed` and the indexer's mirror may not surface them.
         let mut mint_to_bank: HashMap<Pubkey, Pubkey> = HashMap::new();
         for m in &markets {
-            let market_pk = Pubkey::from_str(&m.address).with_context(|| {
-                format!("indexer returned invalid market address {}", m.address)
-            })?;
-            let MarketBankBindings {
-                debt_mint,
-                debt_bank,
-                collateral_mint,
-                collateral_bank,
-            } = read_market_bank_bindings(rpc, &market_pk)
-                .await
-                .with_context(|| format!("reading market {market_pk}"))?;
-
             // If two markets bind the same mint to different banks, we
             // refuse to start — that's a misconfiguration we can't
             // silently paper over (different banks = different oracles
             // and rates).
-            if let Some(prev) = mint_to_bank.insert(debt_mint, debt_bank) {
-                if prev != debt_bank {
+            if let Some(prev) = mint_to_bank.insert(m.debt_mint, m.debt_bank) {
+                if prev != m.debt_bank {
                     bail!(
-                        "market {market_pk} debt_bank {debt_bank} disagrees with prior bank \
-                         {prev} for mint {debt_mint}",
+                        "market {} debt_bank {} disagrees with prior bank {} for mint {}",
+                        m.address,
+                        m.debt_bank,
+                        prev,
+                        m.debt_mint,
                     );
                 }
             }
-            if let Some(prev) = mint_to_bank.insert(collateral_mint, collateral_bank) {
-                if prev != collateral_bank {
+            if let Some(prev) = mint_to_bank.insert(m.collateral_mint, m.collateral_bank) {
+                if prev != m.collateral_bank {
                     bail!(
-                        "market {market_pk} collateral_bank {collateral_bank} disagrees with \
-                         prior bank {prev} for mint {collateral_mint}",
+                        "market {} collateral_bank {} disagrees with prior bank {} for mint {}",
+                        m.address,
+                        m.collateral_bank,
+                        prev,
+                        m.collateral_mint,
                     );
                 }
             }

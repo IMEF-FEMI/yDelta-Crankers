@@ -39,7 +39,6 @@ impl fmt::Debug for KeypairSource {
 pub struct Config {
     pub network: Network,
     pub rpc_url: String,
-    pub indexer_base_url: String,
 
     pub program_id: Pubkey,
     pub marginfi_program_id: Pubkey,
@@ -86,6 +85,15 @@ pub struct CuratorSignerConfig {
     /// Markets this curator manages. The keeper iterates over these and
     /// keeps each order in sync.
     pub managed_markets: Vec<Pubkey>,
+    /// Bootstrap baseline used in the risk-weighted exposure formula
+    /// when a profile has zero deposits. The keeper computes
+    /// `target = pool × risk_score_bps / 10_000` per (profile, market),
+    /// where `pool = max(profile.total_principal_atoms, baseline)`.
+    /// `risk_score_bps` blends `max_ltv_bps`, `max_term_seconds`, and
+    /// `allowed_market_max` into a [0, 10_000] score. Default 500 USDC
+    /// (= 500_000_000 atoms at 6-decimal mints) — sized to keep the
+    /// single-vault bootstrap quote bounded until real deposits land.
+    pub exposure_baseline_atoms: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -121,6 +129,11 @@ pub struct ThresholdsConfig {
     pub min_liquidation_profit_atoms: u64,
     /// Curator keeper skips updates where `|target - current| < this`.
     pub curator_min_delta_bps: u16,
+    /// Curator keeper skips a `SetSeatMaxExposureForRiskProfile` when
+    /// `|target - on_chain| / max(target, on_chain) < this`. Guards
+    /// against per-tick jitter from accrued deposits / repayments
+    /// nudging the computed cap by single atoms.
+    pub curator_min_exposure_delta_bps: u16,
     /// Curator keeper enforces ≥ this between updates to a given
     /// (profile, market). Avoids back-of-queue churn.
     pub curator_min_update_interval: Duration,
@@ -164,9 +177,6 @@ impl Config {
 
         let network: Network = require_var("NETWORK")?.parse()?;
         let rpc_url = require_var("RPC_URL")?;
-        let indexer_base_url = require_var("INDEXER_BASE_URL")?
-            .trim_end_matches('/')
-            .to_string();
 
         let program_id = parse_pubkey(
             &optional_var("YDELTA_PROGRAM_ID").unwrap_or_else(|| ydelta::id().to_string()),
@@ -224,6 +234,7 @@ impl Config {
         let thresholds = ThresholdsConfig {
             min_liquidation_profit_atoms: u64_var("MIN_LIQUIDATION_PROFIT_ATOMS", 1_000_000)?,
             curator_min_delta_bps: u64_var("CURATOR_MIN_DELTA_BPS", 25)? as u16,
+            curator_min_exposure_delta_bps: u64_var("CURATOR_MIN_EXPOSURE_DELTA_BPS", 500)? as u16,
             curator_min_update_interval: secs_var("CURATOR_MIN_UPDATE_INTERVAL_SEC", 300)?,
             maturity_extra_buffer: secs_var("MATURITY_EXTRA_BUFFER_SEC", 30)?,
         };
@@ -234,7 +245,6 @@ impl Config {
         Ok(Self {
             network,
             rpc_url,
-            indexer_base_url,
             program_id,
             marginfi_program_id,
             marginfi_group,
@@ -256,10 +266,10 @@ impl Config {
     pub async fn discover_banks_from_markets(
         &mut self,
         rpc: &crate::rpc::Rpc,
-        indexer: &crate::indexer_client::IndexerClient,
+        chain: &crate::chain_reader::ChainReader,
     ) -> Result<()> {
         self.banks =
-            BankRegistry::discover_from_markets(rpc, indexer, &self.marginfi_program_id).await?;
+            BankRegistry::discover_from_markets(rpc, chain, &self.marginfi_program_id).await?;
         Ok(())
     }
 }
@@ -273,7 +283,6 @@ impl fmt::Debug for Config {
         f.debug_struct("Config")
             .field("network", &self.network)
             .field("rpc_url", &redact_url(&self.rpc_url))
-            .field("indexer_base_url", &redact_url(&self.indexer_base_url))
             .field("program_id", &self.program_id)
             .field("marginfi_program_id", &self.marginfi_program_id)
             .field("marginfi_group", &self.marginfi_group)
@@ -298,7 +307,7 @@ impl fmt::Debug for Config {
 /// Provider URLs (Helius/Triton/Quicknode) put API keys in
 /// `?api-key=…`; basic-auth URLs put creds in `user:pass@host`.
 /// Emitting the raw URL would leak those to stdout / log aggregators.
-pub(crate) fn redact_url(url: &str) -> String {
+pub fn redact_url(url: &str) -> String {
     let no_query = url.split('?').next().unwrap_or(url);
     if let Some(scheme_end) = no_query.find("://") {
         let after_scheme = &no_query[scheme_end + 3..];
@@ -384,6 +393,7 @@ fn parse_curator_signers() -> Result<Vec<CuratorSignerConfig>> {
                     .iter()
                     .map(|m| parse_pubkey(m))
                     .collect::<Result<Vec<_>>>()?,
+                exposure_baseline_atoms: c.exposure_baseline_atoms.unwrap_or(500_000_000),
             })
         })
         .collect()
@@ -408,6 +418,10 @@ struct CuratorSignerJson {
     target_rate_fallback_bps: Option<u16>,
     target_term_seconds: u32,
     markets: Vec<String>,
+    /// Baseline used when the profile has no deposits. Optional;
+    /// defaults to 500 USDC atoms (`500_000_000`) when unset.
+    #[serde(default)]
+    exposure_baseline_atoms: Option<u64>,
 }
 
 fn require_var(name: &str) -> Result<String> {

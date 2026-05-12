@@ -2,7 +2,11 @@
 
 Off-chain keeper bots for the [yDelta](../ydelta) protocol. Five
 cranking services in one binary, each running its own poll loop with
-shared RPC + indexer state.
+shared RPC state. State discovery is entirely chain-driven —
+`getProgramAccounts` against the ydelta program for markets/loans, plus
+in-place hypertree walks on `MarketFixed` and `GlobalVaultFixed` for
+order books, matched-loan queues, and risk profiles. No indexer
+endpoint.
 
 ## Cranking services
 
@@ -31,6 +35,13 @@ enable flag.
    The quoted rate is clamped to `[marginfi_supply_apr, marginfi_borrow_apr]`;
    if marginfi's curve is inverted (`borrow ≤ supply`), the keeper quotes
    at `supply` so LPs never earn below the marginfi-supply baseline.
+   When no live ask exists yet, the keeper bootstraps the
+   `(vault, profile, market)` end-to-end: if the vault-owned
+   `ClaimedSeat` is also missing, it bundles `ClaimSeatForRiskProfile`
+   (tag 15) + `PlaceOrderForRiskProfile` (tag 16) into one atomic tx
+   so the order is live in a single round-trip. Both ixs are signed
+   by the per-profile curator keypair (the yDelta program gates both
+   on `signer == profile.curator`).
 
 | Handler | Instructions | Signer | Permissionless? |
 |---|---|---|---|
@@ -43,17 +54,24 @@ enable flag.
 ## Architecture
 
 ```
-indexer (REST)  ──HTTP poll──►  cranker (handlers)  ──Tx──►  RPC
-                                       │
-                                       └── reads MarketFixed via RPC
-                                           for matched-loan queue
-                                           (indexer doesn't expose it)
+                              ┌── getProgramAccounts(MarketFixed)
+                              ├── getProgramAccounts(LoanFixed, market | vault+profile filter)
+RPC  ◄──────  cranker  ──────►├── getAccountInfo(MarketFixed)  ── walk hypertree (asks/bids/matched_loans)
+                              ├── getAccountInfo(GlobalVaultFixed) ── walk risk_profiles tree
+                              └── Tx ── ix submission
 ```
 
-No Geyser, no WebSocket subscriptions. The indexer is the system of
-record for candidate discovery; the cranker is a periodic poller. This
-keeps the bot lean (~1500 LOC) and operations free of a separate
-streaming provider on day 1.
+No Geyser, no WebSocket subscriptions, no indexer. Candidate discovery
+is `getProgramAccounts` on the ydelta program filtered by account
+discriminator (and `market` / `lender_global_vault` memcmps where it
+narrows the set). Dynamic-region data — order books, matched-loan
+queues, vault risk profiles — is fetched via `getAccountInfo` and
+walked in-place with the hypertree iterators from the program crate.
+
+A short-TTL in-process cache (`ChainReader::list_markets`, 30s)
+deduplicates the market list across handler ticks so the bot makes
+one `getProgramAccounts(MarketFixed)` per ~30s rather than per
+handler-tick.
 
 When the LTV liquidator hits competitive pressure (third-party keepers
 racing for the bonus), swap the candidate source for a Geyser stream.
@@ -71,9 +89,10 @@ crankers/
     ├── config.rs         env → typed Config
     ├── signer.rs         load Keypair JSON files
     ├── rpc.rs            send + sim + retry; priority-fee preamble
-    ├── indexer_client.rs typed HTTP client over the indexer REST API
-    ├── bank_registry.rs  per-mint marginfi bank metadata, env-driven
-    ├── market_reader.rs  direct RPC reads of `MarketFixed` + hypertree
+    ├── chain_reader.rs   on-chain state reader (markets, loans, orders,
+    │                       risk profiles, matched-loan queues) — full
+    │                       replacement for the indexer client
+    ├── bank_registry.rs  per-mint marginfi bank metadata, chain-driven
     └── handlers/
         ├── mod.rs            Handler trait + supervisor
         ├── util.rs           shared helpers (now_unix, token program id)
@@ -100,8 +119,7 @@ cranker needs.
 
 Prereqs: Rust 1.90 (set in `rust-toolchain.toml` — newer than the
 program crate because the cranker builds for the host and gets pulled
-into the modern `solana-zk-sdk` graph), a Solana RPC endpoint, the
-yDelta indexer running and reachable.
+into the modern `solana-zk-sdk` graph) and a Solana RPC endpoint.
 
 yDelta runs on **localhost** (solana-test-validator) and **mainnet**
 only. Point `RPC_URL` at the appropriate endpoint and seed `BANKS` /
@@ -112,17 +130,36 @@ only. Point `RPC_URL` at the appropriate endpoint and seed `BANKS` /
 cp .env.example .env
 # Fill in:
 #   - RPC_URL
-#   - INDEXER_BASE_URL
 #   - FEE_PAYER_KEYPAIR (path to a funded keypair JSON)
 #   - MARGINFI_GROUP + MARGINFI_PROGRAM_ID
-#   - BANKS (per-mint bank metadata)
-#   - LIQUIDATOR_DEBT_ATAS + LIQUIDATOR_COLLATERAL_ATAS
 #   - CURATORS (if running the curator keeper)
+#
+# Bank metadata and the liquidator's ATAs are derived from chain at
+# boot — no env entry needed.
 
 cargo run --release
 ```
 
 Disable handlers you don't want to run via the `*_ENABLED=false` env vars.
+
+### One-shot helpers
+
+`src/bin/` carries small standalone binaries that reuse the same Config /
+Signers / Rpc plumbing the supervisor uses. They read the same `.env`,
+so once your dev env works for the main bot it works for these too.
+
+- `place_order` — submit a single primary `PlaceOrder` ix on the
+  SOL/USDC market, signed by the fee payer. Defaults to a $10 USDC
+  Limit Ask at 7.20% APY / 14d term; override via
+  `PLACE_ORDER_SIDE` / `PLACE_ORDER_PRINCIPAL_ATOMS` /
+  `PLACE_ORDER_RATE_BPS` / `PLACE_ORDER_TERM_SECONDS` /
+  `PLACE_ORDER_COLLATERAL_ATOMS` / `PLACE_ORDER_LAST_VALID_TS` /
+  `PLACE_ORDER_FLAGS`. Asks require pre-deposited USDC on the
+  signer's seat; Bids require pre-deposited wSOL collateral.
+
+  ```sh
+  cargo run --release --bin place_order
+  ```
 
 ## Railway deploy
 
@@ -147,31 +184,25 @@ Disable handlers you don't want to run via the `*_ENABLED=false` env vars.
      `ydelta_cranker_signer_sol_balance{signer,pubkey}`.
    - Set `LOG_FORMAT=json` for structured stdout logs.
 
-## Indexer dependencies
+## Chain reads in use
 
-Endpoints the cranker consumes today (all under `/v1`):
+Every handler talks to the RPC directly via `ChainReader`:
 
-- `GET /health`
-- `GET /loans?vault=&profile_id=&state=&market=&limit=` — candidates for
-  claimer / liquidator.
-- `GET /loans/:address` — full loan view (needed for `matched_loan_sequence`).
-- `GET /markets` — list of markets with `debt_mint` / `collateral_mint`.
-- `GET /markets/:address/orders[?owner=]` — current resting orders for
-  the curator keeper to compare against.
-- `GET /vaults/:address/profiles/:profile_id` — `active_markets` list for
-  policy sync.
-- `GET /events?kinds=risk_profile_updated&from_slot=` — change feed for
-  policy sync.
+- `getProgramAccounts(ydelta, filter=MarketFixed-discrim, data_size=512)`
+  — used at boot (bank discovery) and on a 30s TTL cache during normal
+  operation. Drives the markets list every handler reads.
+- `getProgramAccounts(ydelta, filter=LoanFixed-discrim + market memcmp)`
+  — liquidator per-market scan.
+- `getProgramAccounts(ydelta, filter=LoanFixed-discrim + lender_global_vault +
+  lender_profile_id memcmps)` — claimer per-profile scan.
+- `getAccountInfo(market)` — promoter (matched-loan queue walk),
+  curator keeper (asks tree walk for the managed order), liquidator
+  (seat lookups).
+- `getAccountInfo(global_vault)` — policy_sync (read live
+  `RiskProfile.active_markets`).
 
-Missing / nice-to-have (the cranker has fallbacks):
-
-- `GET /markets/:address/matched-loans` — would replace the cranker's
-  direct `MarketFixed` walk in `market_reader.rs`.
-- `state=repaid_unclaimed` filter on `/loans` — would replace the
-  client-side filter in `claimer.rs`.
-- Per-loan `matured_at` / `liquidatable` precomputes — would let the
-  liquidator skip per-loan tag-40/41 sims when the indexer can already
-  rule them out.
+Hypertree walks live in-process via the `hypertree` crate that ships
+alongside the program, so the on-disk layout can't drift.
 
 ## Known v1 limitations
 

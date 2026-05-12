@@ -21,14 +21,17 @@ path = "src/main.rs"
 # Pinned to a specific commit; bump when ydelta ships a change the
 # cranker needs. To update: edit the `rev` here and re-run `cargo
 # build` (Cargo.lock regenerates the relevant entries automatically).
-ydelta = { git = "https://github.com/IMEF-FEMI/yDelta.git", rev = "2aa1a940f1966796f7532226b092277f1bd9f6a8", features = ["no-entrypoint"] }
-hypertree = { git = "https://github.com/IMEF-FEMI/yDelta.git", rev = "2aa1a940f1966796f7532226b092277f1bd9f6a8" }
+ydelta = { git = "https://github.com/IMEF-FEMI/yDelta.git", rev = "357c758fceab6bc537c3a6a566f0e711ce8331b5", features = ["no-entrypoint"] }
+hypertree = { git = "https://github.com/IMEF-FEMI/yDelta.git", rev = "357c758fceab6bc537c3a6a566f0e711ce8331b5" }
 
 # Solana client + signing. Match ydelta's pinned 2.2.x family so the
 # Pubkey / Instruction types unify across the path boundary.
 solana-program = "=2.2"
 solana-sdk = "~2.2.0"
 solana-client = "~2.2.0"
+# Needed for the `UiAccountEncoding` enum used by getProgramAccounts
+# configs (base64 encoding for chain reads).
+solana-account-decoder-client-types = "~2.2.0"
 
 # Account decoding (MarketFixed read path).
 bytemuck = { version = "1.7.2", features = ["derive"] }
@@ -59,7 +62,21 @@ dotenvy = "0.15"
 bs58 = "0.5"
 base64 = "0.22"
 
+# Switchboard On-Demand crank SDK. Pinned to the same commit eva01
+# uses so the API matches `references/eva01/src/utils/swb_cranker.rs`.
+# Used by `swb_crank.rs` to refresh `SwitchboardPull` feeds inline
+# before a PlaceOrder, matching eva01's standalone-crank pattern.
+switchboard-on-demand-client = { git = "https://github.com/switchboard-xyz/switchboard-sdk", rev = "7fce771e8af381058e69d8911c777e93dc20c81c" }
+
 [profile.release]
 codegen-units = 1
 lto = "fat"
 strip = "debuginfo"
+
+# Local-dev override: when ydelta is being edited in the sibling
+# `../ydelta` checkout, point both ydelta and hypertree at the local
+# crates so the cranker picks up unpushed changes. Remove (or bump the
+# `rev` above) once the ydelta change is merged + tagged.
+[patch."https://github.com/IMEF-FEMI/yDelta.git"]
+ydelta = { path = "../ydelta/programs/ydelta" }
+hypertree = { path = "../ydelta/lib" }

@@ -191,6 +191,8 @@ mod tests {
         let bps_to_fp48 = |b: u32| ((b as u128) << 48) / 10_000;
         BankView {
             mint: Pubkey::default(),
+            liquidity_vault: Pubkey::default(),
+            lva_bump: 0,
             asset_share_value_fp48: asset_share_value as i128,
             liability_share_value_fp48: liab_share_value as i128,
             total_asset_shares_fp48: total_assets as i128,
