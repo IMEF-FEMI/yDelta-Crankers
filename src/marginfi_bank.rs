@@ -148,7 +148,7 @@ impl BankView {
                 BANK_ACCOUNT_SIZE
             ));
         }
-        if &data[..DISCRIMINATOR_LEN] != BANK_DISCRIMINATOR {
+        if data[..DISCRIMINATOR_LEN] != BANK_DISCRIMINATOR {
             return Err(anyhow!(
                 "bank account discriminator mismatch (not a marginfi Bank?)"
             ));
@@ -171,10 +171,10 @@ impl BankView {
         let zero_util_rate_u32 = read_u32(body, OFF_ZERO_UTIL_RATE);
         let hundred_util_rate_u32 = read_u32(body, OFF_HUNDRED_UTIL_RATE);
         let mut points = [(0u32, 0u32); NUM_CURVE_POINTS];
-        for i in 0..NUM_CURVE_POINTS {
+        for (i, slot) in points.iter_mut().enumerate() {
             let util = read_u32(body, OFF_POINTS + i * 8);
             let rate = read_u32(body, OFF_POINTS + i * 8 + 4);
-            points[i] = (util, rate);
+            *slot = (util, rate);
         }
 
         let oracle_setup = body[OFF_ORACLE_SETUP];

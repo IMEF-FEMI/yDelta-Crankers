@@ -1,7 +1,7 @@
-//! Entrypoint. Loads config, signers, RPC; verifies the chain endpoint
-//! is reachable; spawns enabled handlers; awaits sigterm.
-
-use std::sync::{atomic::AtomicBool, Arc};
+use std::{
+    collections::HashMap,
+    sync::{atomic::AtomicBool, Arc, RwLock},
+};
 
 use anyhow::{Context, Result};
 use tracing_subscriber::EnvFilter;
@@ -9,12 +9,12 @@ use tracing_subscriber::EnvFilter;
 use ydelta_crankers::chain_reader::ChainReader;
 use ydelta_crankers::config::{redact_url, Config};
 use ydelta_crankers::handlers::{
-    spawn, ClaimerHandler, CuratorKeeperHandler, HandlerContext, LiquidatorHandler,
-    PolicySyncHandler, PromoterHandler,
+    spawn, ClaimerHandler, CuratorFeeClaimerHandler, HandlerContext, LiquidatorHandler,
+    PromoterHandler,
 };
 use ydelta_crankers::rpc::Rpc;
 use ydelta_crankers::signer::Signers;
-use ydelta_crankers::{health_server, metrics};
+use ydelta_crankers::{health_server, metrics, swb_cranker};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -22,10 +22,7 @@ async fn main() -> Result<()> {
     install_panic_hook();
     tracing::info!("ydelta-crankers starting");
 
-    let mut cfg = Config::from_env()?;
-    // The RPC URL goes through `redact_url` so embedded API keys
-    // (Helius / Triton / Quicknode all use `?api-key=…`) and any
-    // basic-auth userinfo don't end up in Railway log streams.
+    let cfg = Config::from_env()?;
     tracing::info!(
         network = cfg.network.as_str(),
         program_id = %cfg.program_id,
@@ -41,46 +38,40 @@ async fn main() -> Result<()> {
         .with_stop_signal(stop.clone());
     let chain = ChainReader::new(rpc.clone(), cfg.program_id);
 
-    // Discover marginfi bank metadata at boot: walk every market the
-    // chain reader surfaces, pull `(debt_bank, collateral_bank)` from
-    // each `MarketFixed`, then resolve each unique bank's full
-    // metadata from chain. No env input — the operator can't typo what
-    // they don't enter.
     cfg.discover_banks_from_markets(&rpc, &chain)
         .await
         .context("discover_banks_from_markets failed")?;
     tracing::info!(
-        banks = cfg.banks.len(),
+        banks = cfg.banks_snapshot().len(),
         "discovered marginfi banks from on-chain markets",
     );
 
-    // Bootstrap the fee-payer's SPL ATAs for every bank's mint. Uses
-    // the idempotent create-ATA ix so this is safe to run on every
-    // boot — already-existing accounts are no-ops. Operator still
-    // needs to FUND the debt-side ATA before the liquidator can do
-    // anything; we just create the empty account.
-    cfg.banks
+    // Bootstrap empty ATAs for every known mint. Operator still has to
+    // FUND the debt-side ATAs before the liquidator can settle.
+    cfg.banks_snapshot()
         .ensure_atas_for(&rpc, &signers.fee_payer)
         .await
         .context("ensure_atas_for failed")?;
+    for (curator_pk, keypair) in signers.curators.iter() {
+        if let Err(e) = cfg
+            .banks_snapshot()
+            .ensure_atas_for(&rpc, keypair.as_ref())
+            .await
+        {
+            tracing::warn!(curator = %curator_pk, error = %e, "ensure_atas_for(curator) failed");
+        }
+    }
     let cfg = Arc::new(cfg);
 
-    // Install Prometheus exporter before any metric emission. Listener
-    // binds on `METRICS_BIND` (default 127.0.0.1:9091 — local-only).
-    // The metrics endpoint exposes per-handler ix-submission counters;
-    // exposing those publicly leaks liquidation cadence as a live
-    // trading signal. Bind publicly (e.g. 0.0.0.0:9091) ONLY behind a
-    // private Railway network or an auth proxy.
+    // Bind privately by default — the per-handler ix counters leak
+    // liquidation cadence as a trading signal. Expose publicly only
+    // behind a private network or auth proxy.
     let metrics_bind: std::net::SocketAddr = std::env::var("METRICS_BIND")
         .unwrap_or_else(|_| "127.0.0.1:9091".to_string())
         .parse()?;
     metrics::install(metrics_bind)?;
     tracing::info!(addr = %metrics_bind, "prometheus exporter listening");
 
-    // Health endpoints (/healthz, /readyz) on a separate bind from
-    // metrics. `/healthz` is meant to be reachable from Railway's
-    // health probe — bind 0.0.0.0:$HEALTH_PORT (default 8080) by
-    // default. `/readyz` returns 503 until `ready` flips below.
     let health_bind: std::net::SocketAddr = std::env::var("HEALTH_BIND")
         .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
         .parse()?;
@@ -88,13 +79,11 @@ async fn main() -> Result<()> {
     let _health_task = health_server::spawn(health_bind, ready.clone(), stop.clone());
     tracing::info!(addr = %health_bind, "health endpoints listening (/healthz, /readyz)");
 
-    // Boot-time connectivity checks. Fail fast on misconfig.
     let slot = rpc.client().get_slot().await?;
     tracing::info!(slot, "rpc reachable");
 
     let stop_signal = stop.clone();
     tokio::spawn(async move {
-        // Wait for either sigterm or sigint.
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("sigterm handler installs");
         let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
@@ -106,35 +95,71 @@ async fn main() -> Result<()> {
         stop_signal.store(true, std::sync::atomic::Ordering::Relaxed);
     });
 
+    // Switchboard pull-feed cranker — only when a Switchboard-collateral
+    // market exists and the liquidator is enabled (it loads the swb queue +
+    // gateway from chain at boot). A boot failure is non-fatal: the
+    // liquidator skips the pre-crank and logs.
+    let swb_cranker = if cfg.handlers.liquidator_enabled && cfg.banks_snapshot().has_switchboard_pull()
+    {
+        match swb_cranker::SwbCranker::new(
+            cfg.rpc_url.clone(),
+            ydelta::protocol::oracles::SWITCHBOARD_ON_DEMAND_PROGRAM_ID,
+            signers.fee_payer.clone(),
+        )
+        .await
+        {
+            Ok(c) => {
+                tracing::info!("switchboard pull-feed cranker initialized");
+                Some(Arc::new(c))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "switchboard cranker init failed; liquidator will skip Switchboard pre-crank");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let fee_payer_low = Arc::new(AtomicBool::new(false));
+    let ata_balances = Arc::new(RwLock::new(HashMap::new()));
     let ctx = HandlerContext {
         cfg: cfg.clone(),
         rpc: rpc.clone(),
-        chain,
+        chain: chain.clone(),
         signers: signers.clone(),
         stop: stop.clone(),
         fee_payer_low: fee_payer_low.clone(),
+        ata_balances: ata_balances.clone(),
+        swb_cranker,
     };
 
-    // Background gauge refresher for signer SOL balances. Also flips
-    // `fee_payer_low` on each threshold crossing so the supervisor
-    // can pause fee-payer handlers when the wallet drains.
     let _sol_balance_task = metrics::spawn_sol_balance_loop(
-        rpc,
-        signers,
+        rpc.clone(),
+        signers.clone(),
         stop.clone(),
         fee_payer_low,
         cfg.min_signer_balance_lamports,
     );
 
+    let _ata_balance_task = metrics::spawn_ata_balance_loop(
+        rpc.clone(),
+        cfg.clone(),
+        signers.clone(),
+        stop.clone(),
+        ata_balances,
+        std::time::Duration::from_secs(60),
+    );
+
+    let _bank_refresh_task = metrics::spawn_bank_refresh_loop(
+        rpc.clone(),
+        chain.clone(),
+        cfg.clone(),
+        stop.clone(),
+        cfg.banks_refresh_interval,
+    );
+
     let mut handles = Vec::new();
-    if cfg.handlers.policy_sync_enabled {
-        handles.push(spawn(
-            Arc::new(PolicySyncHandler::new()),
-            ctx.clone(),
-            cfg.handlers.policy_sync_interval,
-        ));
-    }
     if cfg.handlers.promoter_enabled {
         handles.push(spawn(
             Arc::new(PromoterHandler::new()),
@@ -156,19 +181,16 @@ async fn main() -> Result<()> {
             cfg.handlers.liquidator_interval,
         ));
     }
-    if cfg.handlers.curator_keeper_enabled && !cfg.curator_signers.is_empty() {
+    if cfg.handlers.curator_fee_claimer_enabled {
         handles.push(spawn(
-            Arc::new(CuratorKeeperHandler::new()),
+            Arc::new(CuratorFeeClaimerHandler::new()),
             ctx.clone(),
-            cfg.handlers.curator_keeper_interval,
+            cfg.handlers.curator_fee_claimer_interval,
         ));
     }
 
     tracing::info!(handlers_spawned = handles.len(), "bot running");
 
-    // Bank discovery + ATA bootstrap done, handlers running → mark
-    // /readyz as 200. Anything before this is still in cold-boot;
-    // probes get a 503 and Railway / k8s won't route traffic yet.
     ready.store(true, std::sync::atomic::Ordering::Relaxed);
 
     for h in handles {
@@ -178,13 +200,9 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Replace the default panic handler so a panic inside ANY tokio task
-/// (handler tick, gauge loop, ATA bootstrap, etc.) logs payload + file
-/// + line + a captured backtrace and then exits the process. Without
-/// this, tokio swallows task panics into a `JoinError::is_panic()` that
-/// nobody is awaiting, and the bot keeps running with one dead handler.
-///
-/// Railway / k8s see the non-zero exit and restart cleanly.
+/// Without this, tokio swallows task panics into a `JoinError` that
+/// nobody awaits — the bot keeps running with one dead handler. Force
+/// a process exit so the orchestrator restarts cleanly.
 fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         let payload = info.payload();
@@ -205,8 +223,6 @@ fn install_panic_hook() {
             backtrace = %backtrace,
             "ydelta-crankers panic — terminating",
         );
-        // Flush stdout/stderr where possible before exit so the panic
-        // log isn't lost to buffering.
         use std::io::Write as _;
         let _ = std::io::stderr().flush();
         let _ = std::io::stdout().flush();
@@ -217,7 +233,6 @@ fn install_panic_hook() {
 fn init_logging() {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,ydelta_crankers=info"));
-    // Plain text for local; JSON layer kicks in if `LOG_FORMAT=json`.
     if std::env::var("LOG_FORMAT").as_deref() == Ok("json") {
         tracing_subscriber::fmt()
             .with_env_filter(filter)

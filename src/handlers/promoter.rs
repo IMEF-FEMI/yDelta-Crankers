@@ -1,19 +1,5 @@
-//! `ProcessMatchedLoan` (tag 7) — promote queue nodes into LoanFixed PDAs.
-//!
-//! Walks `MarketFixed` accounts via RPC (via `ChainReader`) to find the
-//! MatchedLoan queue, then submits one ix per pending node. Cranker
-//! pays loan-PDA rent; recovered at claim time when the lender (or
-//! our claimer handler) passes us as `cranker_refund`.
-//!
-//! Modes (driven by `MatchedLoan.flags`):
-//!   - Primary       → empty loan PDA, builds via `process_matched_loan_instruction`
-//!   - SecondaryFull → existing loan, builds via `process_secondary_matched_loan_instruction`
-//!   - SecondarySplit → existing loan + new sub-loan PDA, builds via
-//!     `process_secondary_split_matched_loan_instruction`
-//!
-//! Vault-lender primary matches additionally need the `VaultSettleAddrs`
-//! bundle (15 accounts). Assembled from `BankRegistry` + on-chain
-//! ydelta PDAs. Skipped with a warning if the bank isn't configured.
+//! `ProcessMatchedLoan` (tag 5). Cranker pays loan-PDA rent; the
+//! program refunds it to `loan.created_by` at claim time.
 
 use std::sync::Mutex;
 use std::time::Instant;
@@ -22,10 +8,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use solana_program::pubkey::Pubkey;
 use solana_sdk::signature::Signer as _;
-use ydelta::program::instruction_builders::{
-    process_matched_loan_instruction, process_secondary_matched_loan_instruction,
-    process_secondary_split_matched_loan_instruction, VaultSettleAddrs,
-};
+use ydelta::program::instruction_builders::{process_matched_loan_instruction, VaultSettleAddrs};
 use ydelta::state::vault::{
     global_vault_integration_account_pda, global_vault_pda, global_vault_signer_pda,
     global_vault_staging_pda,
@@ -34,13 +17,10 @@ use ydelta::validation::token_checkers::get_vault_address;
 use ydelta::validation::{get_lender_integration_account_address, get_market_signer_address};
 
 use crate::chain_reader::{MarketView, PendingMatchedLoan};
-use ydelta::state::OWNER_KIND_RISK_PROFILE;
 
 use super::{Handler, HandlerContext};
 
 pub struct PromoterHandler {
-    /// Track in-flight (market, sequence) pairs so we don't double-submit
-    /// when a tx is confirming. Reset on success/failure.
     inflight: Mutex<std::collections::HashSet<(Pubkey, u64)>>,
 }
 
@@ -49,6 +29,12 @@ impl PromoterHandler {
         Self {
             inflight: Mutex::new(Default::default()),
         }
+    }
+}
+
+impl Default for PromoterHandler {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -85,7 +71,7 @@ impl Handler for PromoterHandler {
                 self.release_inflight(&entry);
                 match res {
                     Ok(true) => promoted += 1,
-                    Ok(false) => {} // skipped (e.g. unsupported config)
+                    Ok(false) => {}
                     Err(e) => tracing::warn!(
                         market = %entry.market,
                         seq = entry.sequence,
@@ -110,14 +96,14 @@ impl Handler for PromoterHandler {
 
 impl PromoterHandler {
     fn claim_inflight(&self, e: &PendingMatchedLoan) -> bool {
-        let key = (e.market, e.sequence);
-        let mut s = self.inflight.lock().unwrap();
-        s.insert(key)
+        self.inflight.lock().unwrap().insert((e.market, e.sequence))
     }
 
     fn release_inflight(&self, e: &PendingMatchedLoan) {
-        let mut s = self.inflight.lock().unwrap();
-        s.remove(&(e.market, e.sequence));
+        self.inflight
+            .lock()
+            .unwrap()
+            .remove(&(e.market, e.sequence));
     }
 
     async fn promote_one(
@@ -128,91 +114,29 @@ impl PromoterHandler {
     ) -> Result<bool> {
         let market_pk = market.address;
         let debt_mint = market.debt_mint;
-        let collateral_mint = market.collateral_mint;
 
-        let debt_bank = ctx
-            .cfg
-            .banks
+        let banks = ctx.cfg.banks_snapshot();
+        let debt_bank = banks
             .get(&debt_mint)
-            .ok_or_else(|| anyhow!("no BANKS config for debt mint {debt_mint}"))?;
+            .ok_or_else(|| anyhow!("no BANKS config for debt mint {debt_mint}"))?
+            .clone();
 
         let fee_payer = ctx.signers.fee_payer.clone();
         let payer_pk = fee_payer.pubkey();
 
-        let ix = if entry.is_secondary() {
-            // Secondary cross: existing loan being transferred (or split).
-            // The processor needs collateral bank/oracles for the LTV
-            // re-check, plus optional vault_settle when the NEW lender
-            // (taker) is a risk profile.
-            let collateral_bank =
-                ctx.cfg.banks.get(&collateral_mint).ok_or_else(|| {
-                    anyhow!("no BANKS config for collateral mint {collateral_mint}")
-                })?;
+        let vault_settle = self
+            .assemble_vault_settle(ctx, &market_pk, entry, &debt_mint, &debt_bank)
+            .await?;
 
-            if entry.is_split() {
-                // Split sub-loan path. No vault_settle support yet — the
-                // on-chain processor rejects vault new-lender + split
-                // (`secondary cross to risk-profile new lender does not
-                // yet support split — full-transfer only in v1`). If the
-                // new lender is a vault, this match isn't promotable.
-                if self.new_lender_is_vault(ctx, &market_pk, entry).await? {
-                    tracing::warn!(
-                        market = %market_pk,
-                        seq = entry.sequence,
-                        "skipping split secondary to vault new-lender (on-chain v1 restriction)"
-                    );
-                    return Ok(false);
-                }
-                process_secondary_split_matched_loan_instruction(
-                    &market_pk,
-                    &payer_pk,
-                    /*queue_sequence=*/ entry.sequence,
-                    /*referenced_loan_sequence=*/ entry.referenced_loan_sequence,
-                    /*_next_market_sequence=*/ 0,
-                    &debt_bank.bank,
-                    &collateral_bank.bank,
-                    &debt_bank.oracles,
-                    &collateral_bank.oracles,
-                    &ctx.cfg.marginfi_program_id,
-                    None,
-                )
-            } else {
-                // Full-transfer secondary. May need vault_settle if the
-                // new lender (buyer) is a risk profile.
-                let vault_settle = self
-                    .assemble_secondary_vault_settle(ctx, &market_pk, entry, &debt_mint, debt_bank)
-                    .await?;
-                process_secondary_matched_loan_instruction(
-                    &market_pk,
-                    &payer_pk,
-                    /*queue_sequence=*/ entry.sequence,
-                    /*referenced_loan_sequence=*/ entry.referenced_loan_sequence,
-                    &debt_bank.bank,
-                    &collateral_bank.bank,
-                    &debt_bank.oracles,
-                    &collateral_bank.oracles,
-                    &ctx.cfg.marginfi_program_id,
-                    None,
-                    vault_settle,
-                )
-            }
-        } else {
-            // Primary mode. Determine lender_kind from the seat; if vault,
-            // assemble VaultSettleAddrs.
-            let vault_settle = self
-                .assemble_vault_settle(ctx, &market_pk, entry, &debt_mint, debt_bank)
-                .await?;
-
-            process_matched_loan_instruction(
-                &market_pk,
-                &payer_pk,
-                &debt_bank.bank,
-                &ctx.cfg.marginfi_program_id,
-                entry.sequence,
-                None,
-                vault_settle,
-            )
-        };
+        let ix = process_matched_loan_instruction(
+            &market_pk,
+            &payer_pk,
+            &debt_bank.bank,
+            &ctx.cfg.marginfi_program_id,
+            entry.sequence,
+            None,
+            vault_settle,
+        );
 
         let sig = ctx
             .rpc
@@ -221,62 +145,18 @@ impl PromoterHandler {
         tracing::info!(
             market = %market_pk,
             seq = entry.sequence,
-            secondary = entry.is_secondary(),
-            split = entry.is_split(),
+            loan_type = entry.loan_type,
+            presettled = entry.is_vault_presettled(),
             sig = %sig,
             "matched loan promoted"
         );
         Ok(true)
     }
 
-    /// For a secondary full-transfer, peek at the new lender's seat to
-    /// decide whether the buyer is a risk profile. If yes, the
-    /// processor requires `VaultSettleAddrs` to migrate the buyer's
-    /// cash from `vault.integration` into `market.lender_integration`.
-    async fn assemble_secondary_vault_settle(
-        &self,
-        ctx: &HandlerContext,
-        market: &Pubkey,
-        entry: &PendingMatchedLoan,
-        debt_mint: &Pubkey,
-        debt_bank: &crate::bank_registry::BankInfo,
-    ) -> Result<Option<VaultSettleAddrs>> {
-        if entry.new_lender_seat_index == hypertree::NIL {
-            return Ok(None);
-        }
-        let market_data = ctx
-            .rpc
-            .get_account_data(market)
-            .await?
-            .ok_or_else(|| anyhow!("market {market} disappeared"))?;
-        let new_lender_seat = ctx.chain.read_seat_at(&market_data, entry.new_lender_seat_index)?;
-        if new_lender_seat.owner_kind != OWNER_KIND_RISK_PROFILE {
-            return Ok(None);
-        }
-        let global_vault = new_lender_seat.owner;
-        self.build_vault_settle_addrs(ctx, market, &global_vault, debt_mint, debt_bank)
-    }
-
-    async fn new_lender_is_vault(
-        &self,
-        ctx: &HandlerContext,
-        market: &Pubkey,
-        entry: &PendingMatchedLoan,
-    ) -> Result<bool> {
-        if entry.new_lender_seat_index == hypertree::NIL {
-            return Ok(false);
-        }
-        let market_data = ctx
-            .rpc
-            .get_account_data(market)
-            .await?
-            .ok_or_else(|| anyhow!("market {market} disappeared"))?;
-        let seat = ctx.chain.read_seat_at(&market_data, entry.new_lender_seat_index)?;
-        Ok(seat.owner_kind == OWNER_KIND_RISK_PROFILE)
-    }
-
-    /// If the lender seat is a risk-profile, build VaultSettleAddrs from
-    /// PDAs + the bank registry. Wallet lenders return Ok(None).
+    /// `VaultSettleAddrs` required iff the node is a non-presettled
+    /// Fixed match against a vault lender. P2Pool nodes have no vault
+    /// lender; presettled nodes have already had atoms migrated by
+    /// `ConvertP2PoolToFixed`.
     async fn assemble_vault_settle(
         &self,
         ctx: &HandlerContext,
@@ -285,23 +165,28 @@ impl PromoterHandler {
         debt_mint: &Pubkey,
         debt_bank: &crate::bank_registry::BankInfo,
     ) -> Result<Option<VaultSettleAddrs>> {
-        // The fast path doesn't read the seat unless the flags hint at a
-        // vault lender. The on-chain ix re-checks anyway, so a missed
-        // hint just means we'd send the wrong-shape ix and revert. Use
-        // the flag as the gate.
-        if !entry.has_vault_lender() {
+        if entry.is_p2pool() || entry.is_vault_presettled() || !entry.has_vault_lender() {
             return Ok(None);
         }
 
-        // Get vault and profile from the seat referenced by `lender_seat_index`.
         let market_data = ctx
             .rpc
             .get_account_data(market)
             .await?
             .ok_or_else(|| anyhow!("market {market} disappeared"))?;
-        let seat = ctx.chain.read_seat_at(&market_data, entry.lender_seat_index)?;
-        let global_vault = seat.owner;
-        self.build_vault_settle_addrs(ctx, market, &global_vault, debt_mint, debt_bank)
+        let seat = ctx
+            .chain
+            .read_seat_at(&market_data, entry.lender_seat_index)?;
+        if seat.owner_kind != ydelta::state::OWNER_KIND_RISK_PROFILE {
+            tracing::warn!(
+                market = %market,
+                sequence = entry.sequence,
+                owner_kind = seat.owner_kind,
+                "lender seat owner_kind disagrees with VAULT_LENDER flag; skipping bundle"
+            );
+            return Ok(None);
+        }
+        self.build_vault_settle_addrs(ctx, market, &seat.owner, debt_mint, debt_bank)
     }
 
     fn build_vault_settle_addrs(
@@ -323,7 +208,8 @@ impl PromoterHandler {
             ));
         }
         let (market_debt_vault, _) = get_vault_address(market, debt_mint);
-        let (market_lender_integration_account, _) = get_lender_integration_account_address(market);
+        let (market_lender_integration_account, _) =
+            get_lender_integration_account_address(market);
         let (market_signer, _) = get_market_signer_address(market);
 
         Ok(Some(VaultSettleAddrs {
@@ -336,8 +222,7 @@ impl PromoterHandler {
             market_signer,
             debt_liquidity_vault: debt_bank.liquidity_vault,
             debt_bank_liquidity_vault_authority: debt_bank.liquidity_vault_authority,
-            // Vault-settle path uses primary oracle only per the on-chain
-            // `load_vault_settle_accounts` loader.
+            // `load_vault_settle_accounts` reads exactly one oracle.
             debt_oracles: vec![debt_bank.primary_oracle()],
             debt_mint: *debt_mint,
             token_program: debt_bank.token_program,

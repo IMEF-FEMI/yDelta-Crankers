@@ -1,28 +1,21 @@
-//! Handler trait + supervisor.
-//!
-//! Each handler runs its own loop on its own interval, sharing the RPC,
-//! chain reader, and signer references. A shared `stop` atomic
-//! propagates sigterm/sigint to every loop. Failures inside a tick log
-//! + sleep + continue; we never let one bad tick crash the whole bot.
-
 use std::{
-    sync::{atomic::AtomicBool, Arc},
+    collections::HashMap,
+    sync::{atomic::AtomicBool, Arc, RwLock},
     time::Duration,
 };
 
 use async_trait::async_trait;
+use solana_program::pubkey::Pubkey;
 use tokio::task::JoinHandle;
 
-use crate::{chain_reader::ChainReader, rpc::Rpc, signer::Signers};
+use crate::{chain_reader::ChainReader, rpc::Rpc, signer::Signers, swb_cranker::SwbCranker};
 
 pub mod claimer;
-pub mod curator_keeper;
+pub mod curator_fee_claimer;
 pub mod liquidator;
-pub mod policy_sync;
 pub mod promoter;
 pub mod util;
 
-/// Shared, immutable context every handler gets.
 #[derive(Clone)]
 pub struct HandlerContext {
     pub cfg: Arc<crate::config::Config>,
@@ -30,37 +23,31 @@ pub struct HandlerContext {
     pub chain: ChainReader,
     pub signers: Signers,
     pub stop: Arc<AtomicBool>,
-    /// Set when fee-payer balance drops below
-    /// `cfg.min_signer_balance_lamports`. The supervisor skips ticks
-    /// for handlers where `requires_fee_payer()` is true while this
-    /// flag is set. curator_keeper signs with per-curator keypairs and
-    /// is unaffected.
+    /// Flipped by `metrics::spawn_sol_balance_loop` on threshold
+    /// crossings; the supervisor pauses fee-payer handlers while set.
     pub fee_payer_low: Arc<AtomicBool>,
+    pub ata_balances: Arc<RwLock<HashMap<Pubkey, u64>>>,
+    /// Switchboard pull-feed cranker. `None` when no Switchboard-collateral
+    /// market exists (or boot-time load failed); the liquidator skips the
+    /// pre-crank in that case.
+    pub swb_cranker: Option<Arc<SwbCranker>>,
 }
 
-/// A handler is a periodic tick. Implementors do one unit of work in
-/// `tick()`; the supervisor handles intervals, error logging, and
-/// graceful shutdown.
 #[async_trait]
 pub trait Handler: Send + Sync + 'static {
-    /// Stable name for log filtering.
     fn name(&self) -> &'static str;
 
-    /// Does this handler sign with the fee payer? When true, the
-    /// supervisor pauses ticks while `ctx.fee_payer_low` is set, so a
-    /// drained fee-payer doesn't spew rejected txs. Default true —
-    /// only curator_keeper overrides.
+    /// Override to `false` for handlers that sign with a different
+    /// keypair (e.g. curator-fee-claimer) so the supervisor's
+    /// fee-payer-low gate doesn't pause them.
     fn requires_fee_payer(&self) -> bool {
         true
     }
 
-    /// One iteration of work. Returning Err just logs; never crashes
-    /// the loop. Implementors should treat "no candidates" as Ok(()).
+    /// `Err` is logged and counted; the loop continues.
     async fn tick(&self, ctx: &HandlerContext) -> anyhow::Result<()>;
 }
 
-/// Run a handler in its own task. Returns the JoinHandle so `main` can
-/// await graceful shutdown.
 pub fn spawn(handler: Arc<dyn Handler>, ctx: HandlerContext, interval: Duration) -> JoinHandle<()> {
     let name = handler.name();
     tokio::spawn(async move {
@@ -74,10 +61,6 @@ pub fn spawn(handler: Arc<dyn Handler>, ctx: HandlerContext, interval: Duration)
                 tracing::info!(handler = name, "handler stopping");
                 return;
             }
-            // Skip the tick if the fee-payer is starved and this
-            // handler signs with it. Counted as a distinct outcome so
-            // dashboards can detect "bot is alive but paused waiting
-            // on top-up" without conflating it with normal idle ticks.
             let should_skip_low_balance = handler.requires_fee_payer()
                 && ctx.fee_payer_low.load(std::sync::atomic::Ordering::Relaxed);
             let t0 = std::time::Instant::now();
@@ -127,7 +110,6 @@ pub fn spawn(handler: Arc<dyn Handler>, ctx: HandlerContext, interval: Duration)
                     "tick ok"
                 );
             }
-            // Sleep up to the interval, waking early on stop.
             let deadline = tokio::time::Instant::now() + interval;
             loop {
                 if ctx.stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -145,7 +127,6 @@ pub fn spawn(handler: Arc<dyn Handler>, ctx: HandlerContext, interval: Duration)
 }
 
 pub use claimer::ClaimerHandler;
-pub use curator_keeper::CuratorKeeperHandler;
+pub use curator_fee_claimer::CuratorFeeClaimerHandler;
 pub use liquidator::LiquidatorHandler;
-pub use policy_sync::PolicySyncHandler;
 pub use promoter::PromoterHandler;

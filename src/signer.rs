@@ -1,34 +1,24 @@
-//! Keypair loading. All signers come from on-disk Solana CLI keypair
-//! JSON files (the canonical 64-byte JSON array format).
-//!
-//! Paths are referenced from env vars (`FEE_PAYER_KEYPAIR`,
-//! per-curator entries in `CURATORS`). The actual key bytes live
-//! outside the repo — Railway secret files / k8s secrets / tmpfs.
-
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 use anyhow::{anyhow, bail, Context, Result};
 use solana_program::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer as _};
 
-use crate::config::{Config, CuratorSignerConfig, KeypairSource};
+use crate::config::{Config, KeypairSource};
 
 #[derive(Clone)]
 pub struct Signers {
     pub fee_payer: Arc<Keypair>,
-    /// `(global_vault, profile_id) → curator keypair`.
-    pub curators: HashMap<(Pubkey, u8), Arc<Keypair>>,
+    /// Curator pubkey → keypair. Empty unless `CURATOR_KEYPAIRS_JSON`
+    /// is set. The curator-fee-claimer resolves `profile.curator` here
+    /// and only submits for profiles whose key we hold.
+    pub curators: HashMap<Pubkey, Arc<Keypair>>,
 }
 
 impl Signers {
     pub fn load(cfg: &Config) -> Result<Self> {
         let fee_payer = Arc::new(load_keypair(&cfg.fee_payer_keypair)?);
 
-        // If the operator pinned an expected fee-payer pubkey, assert
-        // the loaded key matches. Catches the misconfig where the
-        // configured source resolves to a curator key (which loads
-        // fine but signs as the wrong wallet, draining the curator's
-        // SOL on every priority-fee preamble).
         if let Some(expected) = cfg.fee_payer_expected_pubkey {
             if fee_payer.pubkey() != expected {
                 bail!(
@@ -41,40 +31,32 @@ impl Signers {
             }
         }
 
-        tracing::info!(
-            pubkey = %fee_payer.pubkey(),
-            "loaded fee payer"
-        );
+        tracing::info!(pubkey = %fee_payer.pubkey(), "loaded fee payer");
 
-        let mut curators = HashMap::new();
-        for c in &cfg.curator_signers {
-            let kp = Arc::new(load_keypair(&c.keypair)?);
-            tracing::info!(
-                vault = %c.global_vault,
-                profile_id = c.profile_id,
-                curator_pubkey = %kp.pubkey(),
-                "loaded curator"
+        let mut curators: HashMap<Pubkey, Arc<Keypair>> = HashMap::new();
+        for (i, b58) in cfg.curator_keypairs_base58.iter().enumerate() {
+            let kp = Arc::new(load_keypair_from_base58(b58).with_context(|| {
+                format!("CURATOR_KEYPAIRS_JSON[{i}]: invalid base58 keypair")
+            })?);
+            let pk = kp.pubkey();
+            if curators.insert(pk, kp).is_some() {
+                tracing::warn!(curator = %pk, "duplicate curator keypair in CURATOR_KEYPAIRS_JSON — kept the last entry");
+            }
+        }
+        for pk in curators.keys() {
+            tracing::info!(curator = %pk, "loaded curator keypair");
+        }
+        if cfg.handlers.curator_fee_claimer_enabled && curators.is_empty() {
+            bail!(
+                "CURATOR_FEE_CLAIMER_ENABLED=true but no curator keypairs in \
+                 CURATOR_KEYPAIRS_JSON — refusing to start"
             );
-            curators.insert((c.global_vault, c.profile_id), kp);
         }
 
         Ok(Self {
             fee_payer,
             curators,
         })
-    }
-
-    pub fn curator_for(&self, c: &CuratorSignerConfig) -> Result<Arc<Keypair>> {
-        self.curators
-            .get(&(c.global_vault, c.profile_id))
-            .cloned()
-            .ok_or_else(|| {
-                anyhow!(
-                    "no loaded curator keypair for (vault={}, profile_id={})",
-                    c.global_vault,
-                    c.profile_id
-                )
-            })
     }
 }
 
@@ -86,12 +68,7 @@ fn load_keypair(src: &KeypairSource) -> Result<Keypair> {
 }
 
 fn load_keypair_from_file(path: &Path) -> Result<Keypair> {
-    // Refuse to load if the file is group- or world-readable. On a
-    // shared host (or even a misconfigured container with a leaky
-    // /secrets mount) this is the difference between "secret on disk"
-    // and "secret anyone with shell can `cat`". Unix-only; on
-    // non-Unix targets (Railway is Linux, so this always runs) we
-    // skip the check.
+    // Refuse group/world-readable files — secret-leak guard.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -109,19 +86,13 @@ fn load_keypair_from_file(path: &Path) -> Result<Keypair> {
 
     let bytes =
         std::fs::read(path).with_context(|| format!("reading keypair file {}", path.display()))?;
-    // Solana CLI format: JSON array of 64 u8s. `read_keypair` from
-    // solana-sdk handles this directly, but it wants a Read impl —
-    // simpler to parse the JSON ourselves and feed bytes to `from_bytes`.
     let arr: Vec<u8> = serde_json::from_slice(&bytes)
         .with_context(|| format!("parsing keypair JSON {}", path.display()))?;
     Keypair::try_from(&arr[..]).map_err(|e| anyhow!("invalid keypair at {}: {e}", path.display()))
 }
 
-/// Decode an inline base58-encoded keypair secret. The string is the
-/// full 64-byte secret encoded as base58 (NOT the Solana CLI JSON
-/// array). Error messages deliberately do NOT include the input —
-/// it's a secret, and an invalid-base58 mishap would otherwise dump
-/// the secret to logs.
+/// Errors deliberately omit the input — it's a secret and an
+/// invalid-base58 mishap would otherwise dump it to logs.
 fn load_keypair_from_base58(s: &str) -> Result<Keypair> {
     let bytes = bs58::decode(s.trim())
         .into_vec()

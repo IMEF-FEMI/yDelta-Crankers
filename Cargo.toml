@@ -21,8 +21,8 @@ path = "src/main.rs"
 # Pinned to a specific commit; bump when ydelta ships a change the
 # cranker needs. To update: edit the `rev` here and re-run `cargo
 # build` (Cargo.lock regenerates the relevant entries automatically).
-ydelta = { git = "https://github.com/IMEF-FEMI/yDelta.git", rev = "68f174042637a99b8025ed2c0ef60d4c20357659", features = ["no-entrypoint"] }
-hypertree = { git = "https://github.com/IMEF-FEMI/yDelta.git", rev = "68f174042637a99b8025ed2c0ef60d4c20357659" }
+ydelta = { git = "https://github.com/IMEF-FEMI/yDelta.git", rev = "c00a0fa08737febd807118cf910e61f84a35289b", features = ["no-entrypoint"] }
+hypertree = { git = "https://github.com/IMEF-FEMI/yDelta.git", rev = "c00a0fa08737febd807118cf910e61f84a35289b" }
 
 # Solana client + signing. Match ydelta's pinned 2.2.x family so the
 # Pubkey / Instruction types unify across the path boundary.
@@ -32,6 +32,10 @@ solana-client = "~2.2.0"
 # Needed for the `UiAccountEncoding` enum used by getProgramAccounts
 # configs (base64 encoding for chain reads).
 solana-account-decoder-client-types = "~2.2.0"
+
+# Switchboard On-Demand pull-feed cranking (collateral oracle refresh
+# before liquidator sims/ixs). Same client eva01 uses.
+switchboard-on-demand-client = { git = "https://github.com/switchboard-xyz/switchboard-sdk", branch = "main" }
 
 # Account decoding (MarketFixed read path).
 bytemuck = { version = "1.7.2", features = ["derive"] }
@@ -62,24 +66,8 @@ dotenvy = "0.15"
 bs58 = "0.5"
 base64 = "0.22"
 
-# Switchboard On-Demand crank SDK. Pinned to the same commit eva01
-# uses so the API matches `references/eva01/src/utils/swb_cranker.rs`.
-# Used by `swb_crank.rs` to refresh `SwitchboardPull` feeds inline
-# before a PlaceOrder, matching eva01's standalone-crank pattern.
-switchboard-on-demand-client = { git = "https://github.com/switchboard-xyz/switchboard-sdk", rev = "7fce771e8af381058e69d8911c777e93dc20c81c" }
-
 [profile.release]
 codegen-units = 1
 lto = "fat"
 strip = "debuginfo"
 
-# To test against an unpushed ydelta change locally, uncomment the
-# block below. Keep it commented in committed builds — Railway's
-# Dockerfile only copies this crate, so the sibling `../ydelta` path
-# doesn't exist there and Cargo would fail with "Unable to update
-# /ydelta/lib". After pushing the ydelta change, bump the `rev` on the
-# `ydelta` / `hypertree` deps above instead.
-#
-# [patch."https://github.com/IMEF-FEMI/yDelta.git"]
-# ydelta = { path = "../ydelta/programs/ydelta" }
-# hypertree = { path = "../ydelta/lib" }

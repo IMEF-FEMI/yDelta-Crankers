@@ -1,23 +1,5 @@
-//! `SettleMaturedLoan` (tag 20) + `LiquidateLoan` (tag 21).
-//!
-//! Discovery: `ChainReader::list_loans_for_market` per known market.
-//! That's a single `getProgramAccounts(LoanFixed)` filtered by market
-//! pubkey — no indexer round-trip. For each loan:
-//!   - Compute the static (oracle-free) collateral/debt ratio and skip
-//!     obviously-overcollateralized loans to save sim cost.
-//!   - Pre-flight via `CheckMaturityLiquidatable` (tag 41) or
-//!     `CheckLtvLiquidatable` (tag 40) via `simulateTransaction`.
-//!   - On Ok sim, send the real ix.
-//!
-//! Profit gate: `MIN_LIQUIDATION_PROFIT_ATOMS` filters out loans where
-//! the keeper bonus is below tx-fee threshold.
-//!
-//! Required external state:
-//!   - Fee-payer's debt-mint ATA must hold enough debt asset to repay
-//!     the loan. ATA address is derived from `(fee_payer, debt_mint,
-//!     token_program)` via `BankInfo::ata_for` — no env config.
-//!   - Bank info for both mints (auto-discovered at boot from each
-//!     market's `MarketFixed` account; see `bank_registry.rs`).
+//! `SettleMaturedLoan` (tag 16) + `LiquidateLoan` (tag 17), pre-flighted
+//! by tag 34 / 35 sims.
 
 use std::{collections::HashSet, sync::Mutex};
 
@@ -33,14 +15,18 @@ use ydelta::state::loan::LoanState;
 
 use crate::chain_reader::{LoanView, MarketView};
 
-use super::util::now_unix;
+use super::util::{min_partial_repay_atoms, now_unix, p2pool_full_repay_staged_atoms};
 use super::{Handler, HandlerContext};
 
 const LOAN_STATE_ACTIVE: u8 = LoanState::Active as u8;
-/// Static LTV pre-filter — only loans above this static debt/collateral
-/// ratio (atom-based, no oracle adjustment) are worth simulating.
-/// Generous floor; the real LTV gate happens in the sim.
-const STATIC_LTV_PREFILTER_BPS: u32 = 5_000;
+
+/// Program sentinel: `repay_atoms_max == 0` clamps to live outstanding.
+const REPAY_FULL: u64 = 0;
+
+/// 1.05× principal — below this a Fixed loan can't plausibly be
+/// LTV-breached, so we skip the sim. P2Pool loans bypass this gate
+/// entirely (the body field doesn't track live marginfi liability).
+const STATIC_LTV_PREFILTER_BPS: u32 = 10_500;
 
 pub struct LiquidatorHandler {
     inflight: Mutex<HashSet<Pubkey>>,
@@ -51,6 +37,12 @@ impl LiquidatorHandler {
         Self {
             inflight: Mutex::new(HashSet::new()),
         }
+    }
+}
+
+impl Default for LiquidatorHandler {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -87,23 +79,22 @@ impl LiquidatorHandler {
         let loans = ctx.chain.list_loans_for_market(&market_pk).await?;
 
         let t_now = now_unix();
-        let grace_buffer = ctx.cfg.thresholds.maturity_extra_buffer.as_secs() as i64;
+        let extra_buffer = ctx.cfg.thresholds.maturity_extra_buffer.as_secs() as i64;
+        let effective_grace = i64::from(market.grace_period_seconds) + extra_buffer;
 
         let mut count = 0;
         for loan in &loans {
-            if loan.state != LOAN_STATE_ACTIVE {
+            if loan.state != LOAN_STATE_ACTIVE || loan.outstanding_debt_atoms == 0 {
                 continue;
             }
-            if loan.outstanding_debt_atoms == 0 {
-                continue;
-            }
-            // Cheap static prefilter — don't pay for sims on obviously
-            // healthy loans.
-            let static_ltv_bps =
-                static_ltv_bps(loan.outstanding_debt_atoms, loan.principal_debt_atoms);
 
-            let matured = t_now >= loan.matures_at_unix + grace_buffer;
-            let maybe_ltv_breach = static_ltv_bps >= STATIC_LTV_PREFILTER_BPS;
+            let matured = t_now >= loan.matures_at_unix.saturating_add(effective_grace);
+            let maybe_ltv_breach = if loan.is_p2pool() {
+                true
+            } else {
+                static_accrued_ratio_bps(loan.outstanding_debt_atoms, loan.principal_debt_atoms)
+                    >= STATIC_LTV_PREFILTER_BPS
+            };
 
             if !matured && !maybe_ltv_breach {
                 continue;
@@ -113,11 +104,9 @@ impl LiquidatorHandler {
             if !self.claim_inflight(loan_pk) {
                 continue;
             }
-            let res = if matured {
-                self.try_settle_matured(ctx, market, loan).await
-            } else {
-                self.try_liquidate_ltv(ctx, market, loan).await
-            };
+            let res = self
+                .try_settle_or_liquidate(ctx, market, loan, matured, maybe_ltv_breach)
+                .await;
             self.release_inflight(loan_pk);
             match res {
                 Ok(true) => count += 1,
@@ -131,12 +120,67 @@ impl LiquidatorHandler {
     }
 
     fn claim_inflight(&self, loan: Pubkey) -> bool {
-        let mut s = self.inflight.lock().unwrap();
-        s.insert(loan)
+        self.inflight.lock().unwrap().insert(loan)
     }
     fn release_inflight(&self, loan: Pubkey) {
-        let mut s = self.inflight.lock().unwrap();
-        s.remove(&loan);
+        self.inflight.lock().unwrap().remove(&loan);
+    }
+
+    /// Post a fresh Switchboard update for the collateral feed before the
+    /// LTV/maturity sim + settle/liquidate ix read it. Switchboard On-Demand
+    /// is pull-based; without this the on-chain staleness gate rejects and
+    /// the loan can never be settled/liquidated. No-op for Pyth-Push
+    /// collateral (Pyth-DA keeps that fresh) or when no cranker is configured;
+    /// a crank failure is non-fatal (the downstream sim still gates).
+    async fn refresh_collateral_oracle(
+        &self,
+        ctx: &HandlerContext,
+        collateral_bank: &crate::bank_registry::BankInfo,
+        loan: &LoanView,
+    ) {
+        if !collateral_bank.is_switchboard_pull() {
+            return;
+        }
+        let Some(cranker) = ctx.swb_cranker.as_ref() else {
+            return;
+        };
+        match cranker.crank(vec![collateral_bank.primary_oracle()]).await {
+            Ok(Some(sig)) => {
+                tracing::debug!(loan = %loan.address, %sig, "cranked switchboard collateral oracle")
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(
+                loan = %loan.address,
+                error = %e,
+                "switchboard collateral crank failed; proceeding (sim will gate)"
+            ),
+        }
+    }
+
+    /// Prefer `liquidate_loan` when under-water: it pays the keeper
+    /// bonus, `settle_matured_loan` doesn't. Fall back to settle when
+    /// the LTV sim refuses but the loan is matured.
+    async fn try_settle_or_liquidate(
+        &self,
+        ctx: &HandlerContext,
+        market: &MarketView,
+        loan: &LoanView,
+        matured: bool,
+        maybe_ltv_breach: bool,
+    ) -> Result<bool> {
+        if maybe_ltv_breach {
+            if self.try_liquidate_ltv(ctx, market, loan).await? {
+                return Ok(true);
+            }
+            if matured {
+                return self.try_settle_matured(ctx, market, loan).await;
+            }
+            return Ok(false);
+        }
+        if matured {
+            return self.try_settle_matured(ctx, market, loan).await;
+        }
+        Ok(false)
     }
 
     async fn try_settle_matured(
@@ -149,14 +193,19 @@ impl LiquidatorHandler {
         let debt_mint = market.debt_mint;
         let collateral_mint = market.collateral_mint;
 
-        let (debt_bank, collateral_bank) = self.banks(ctx, &debt_mint, &collateral_mint)?;
+        let banks = ctx.cfg.banks_snapshot();
+        let (debt_bank, collateral_bank) = bank_pair(&banks, &debt_mint, &collateral_mint)?;
+        let debt_bank = debt_bank.clone();
+        let collateral_bank = collateral_bank.clone();
 
         let sequence = loan.matched_loan_sequence;
-
         let fee_payer = ctx.signers.fee_payer.clone();
         let payer_pk = fee_payer.pubkey();
 
-        // Pre-flight via tag 41.
+        // The maturity sim reads only the debt feed, but the settle ix below
+        // reads the collateral (Switchboard) feed too — refresh it up front.
+        self.refresh_collateral_oracle(ctx, &collateral_bank, loan).await;
+
         let sim_ix = check_maturity_liquidatable_instruction(
             &market_pk,
             &payer_pk,
@@ -164,19 +213,21 @@ impl LiquidatorHandler {
             &debt_bank.bank,
             &ctx.cfg.marginfi_program_id,
         );
-        let _ = &debt_bank.oracles; // unused on the maturity-only sim path
         let sim = ctx.rpc.simulate(vec![sim_ix], &payer_pk).await?;
         if !sim.ok {
             tracing::debug!(loan = %loan.address, error = ?sim.error, "maturity sim failed");
             return Ok(false);
         }
 
-        // ATAs are deterministic PDAs of `(owner, token_program, mint)`.
-        // We derive them from the bank metadata; no env input. The
-        // accounts themselves must exist on chain (fund/create them
-        // once via the wallet's normal SPL flow).
         let liquidator_debt_ata = debt_bank.ata_for(&payer_pk);
         let liquidator_collateral_ata = collateral_bank.ata_for(&payer_pk);
+        let repay_atoms_max = match self
+            .pick_repay_amount(ctx, &liquidator_debt_ata, loan)
+            .await?
+        {
+            Some(v) => v,
+            None => return Ok(false),
+        };
 
         let ix = settle_matured_loan_instruction(
             &market_pk,
@@ -193,22 +244,24 @@ impl LiquidatorHandler {
             &collateral_bank.liquidity_vault_authority,
             &debt_bank.oracles,
             &collateral_bank.oracles,
-            // The processor handles both debt + collateral atom flows under
-            // the debt mint's token program in v0.1.8 of the program
-            // (single token_program account). If we ever face mixed
-            // legacy/2022 pairs in a market, the on-chain ix would need
-            // an extra account; for now we use the debt-side program.
             &debt_bank.token_program,
             &ctx.cfg.marginfi_group,
             &ctx.cfg.marginfi_program_id,
-            0, // 0 = full repay
+            repay_atoms_max,
+            &payer_pk,
         );
 
         let sig = ctx
             .rpc
             .send_signed_labeled("settle_matured_loan", vec![ix], &[&fee_payer])
             .await?;
-        tracing::info!(loan = %loan.address, sig = %sig, "matured loan settled");
+        tracing::info!(
+            loan = %loan.address,
+            loan_type = loan.loan_type,
+            sig = %sig,
+            repay_atoms_max,
+            "matured loan settled"
+        );
         Ok(true)
     }
 
@@ -222,14 +275,19 @@ impl LiquidatorHandler {
         let debt_mint = market.debt_mint;
         let collateral_mint = market.collateral_mint;
 
-        let (debt_bank, collateral_bank) = self.banks(ctx, &debt_mint, &collateral_mint)?;
+        let banks = ctx.cfg.banks_snapshot();
+        let (debt_bank, collateral_bank) = bank_pair(&banks, &debt_mint, &collateral_mint)?;
+        let debt_bank = debt_bank.clone();
+        let collateral_bank = collateral_bank.clone();
 
         let sequence = loan.matched_loan_sequence;
-
         let fee_payer = ctx.signers.fee_payer.clone();
         let payer_pk = fee_payer.pubkey();
 
-        // Pre-flight via tag 40.
+        // The LTV sim AND the liquidate ix read the collateral (Switchboard)
+        // feed — refresh it so the staleness gate doesn't reject.
+        self.refresh_collateral_oracle(ctx, &collateral_bank, loan).await;
+
         let sim_ix = check_ltv_liquidatable_instruction(
             &market_pk,
             &payer_pk,
@@ -246,17 +304,31 @@ impl LiquidatorHandler {
             return Ok(false);
         }
 
-        // Profit gate (heuristic — refine once we read fee_config bonus
-        // bps from the market account).
-        if loan.outstanding_debt_atoms < ctx.cfg.thresholds.min_liquidation_profit_atoms {
-            tracing::debug!(loan = %loan.address, "below min liquidation profit");
+        let expected_bonus = if market.liquidation_keeper_bps > 0 {
+            (loan.outstanding_debt_atoms as u128)
+                .saturating_mul(market.liquidation_keeper_bps as u128)
+                / 10_000u128
+        } else {
+            loan.outstanding_debt_atoms as u128
+        };
+        if expected_bonus < ctx.cfg.thresholds.min_liquidation_profit_atoms as u128 {
+            tracing::debug!(
+                loan = %loan.address,
+                expected_bonus = expected_bonus as u64,
+                "below min liquidation profit"
+            );
             return Ok(false);
         }
 
-        // ATAs are deterministic PDAs of `(owner, token_program, mint)`.
-        // We derive them from the bank metadata; no env input.
         let liquidator_debt_ata = debt_bank.ata_for(&payer_pk);
         let liquidator_collateral_ata = collateral_bank.ata_for(&payer_pk);
+        let repay_atoms_max = match self
+            .pick_repay_amount(ctx, &liquidator_debt_ata, loan)
+            .await?
+        {
+            Some(v) => v,
+            None => return Ok(false),
+        };
 
         let ix = liquidate_loan_instruction(
             &market_pk,
@@ -276,46 +348,120 @@ impl LiquidatorHandler {
             &debt_bank.token_program,
             &ctx.cfg.marginfi_group,
             &ctx.cfg.marginfi_program_id,
-            0, // 0 = full repay
+            repay_atoms_max,
+            &payer_pk,
         );
 
         let sig = ctx
             .rpc
             .send_signed_labeled("liquidate_loan", vec![ix], &[&fee_payer])
             .await?;
-        tracing::info!(loan = %loan.address, sig = %sig, "ltv-breach loan liquidated");
+        tracing::info!(
+            loan = %loan.address,
+            loan_type = loan.loan_type,
+            sig = %sig,
+            repay_atoms_max,
+            "ltv-breach loan liquidated"
+        );
         Ok(true)
     }
 
-    fn banks<'a>(
+    /// Pick the largest `repay_atoms_max` the keeper's ATA can fund.
+    /// Returns `None` when even the program's 1%/1000-atom partial floor
+    /// would overshoot the balance.
+    async fn pick_repay_amount(
         &self,
-        ctx: &'a HandlerContext,
-        debt_mint: &Pubkey,
-        collateral_mint: &Pubkey,
-    ) -> Result<(
-        &'a crate::bank_registry::BankInfo,
-        &'a crate::bank_registry::BankInfo,
-    )> {
-        let debt_bank = ctx
-            .cfg
-            .banks
-            .get(debt_mint)
-            .ok_or_else(|| anyhow!("no BANKS config for debt mint {debt_mint}"))?;
-        let collateral_bank = ctx
-            .cfg
-            .banks
-            .get(collateral_mint)
-            .ok_or_else(|| anyhow!("no BANKS config for collateral mint {collateral_mint}"))?;
-        Ok((debt_bank, collateral_bank))
+        ctx: &HandlerContext,
+        liquidator_debt_ata: &Pubkey,
+        loan: &LoanView,
+    ) -> Result<Option<u64>> {
+        let acct = match ctx.rpc.get_account_data(liquidator_debt_ata).await? {
+            Some(d) => d,
+            None => {
+                tracing::debug!(ata = %liquidator_debt_ata, "liquidator debt ATA missing");
+                return Ok(None);
+            }
+        };
+        let ata_balance =
+            super::util::spl_token_amount(&acct).ok_or_else(|| anyhow!("ATA data too small"))?;
+
+        // P2Pool body outstanding is stale (no on-chain accrue path);
+        // use principal as a more honest floor.
+        let outstanding_est: u64 = if loan.is_p2pool() {
+            loan.outstanding_debt_atoms.max(loan.principal_debt_atoms)
+        } else {
+            loan.outstanding_debt_atoms
+        };
+
+        let full_required = if loan.is_p2pool() {
+            p2pool_full_repay_staged_atoms(outstanding_est)
+        } else {
+            outstanding_est
+        };
+
+        if ata_balance >= full_required {
+            return Ok(Some(REPAY_FULL));
+        }
+
+        let floor = min_partial_repay_atoms(outstanding_est);
+        if ata_balance < floor {
+            tracing::debug!(
+                loan = %loan.address,
+                ata = %liquidator_debt_ata,
+                ata_balance,
+                floor,
+                "ATA below partial-repay floor; skipping"
+            );
+            return Ok(None);
+        }
+        // Cap below outstanding so the program routes through the
+        // partial path (full-close needs P2Pool over-stage headroom).
+        let cap = outstanding_est.saturating_sub(1);
+        Ok(Some(ata_balance.min(cap)))
     }
 }
 
-/// Static debt/principal ratio in bps. Cheap pre-filter only — the real
-/// LTV gate is oracle-priced and runs in the sim.
-fn static_ltv_bps(outstanding_debt_atoms: u64, principal_debt_atoms: u64) -> u32 {
+fn bank_pair<'a>(
+    banks: &'a crate::bank_registry::BankRegistry,
+    debt_mint: &Pubkey,
+    collateral_mint: &Pubkey,
+) -> Result<(
+    &'a crate::bank_registry::BankInfo,
+    &'a crate::bank_registry::BankInfo,
+)> {
+    let debt_bank = banks
+        .get(debt_mint)
+        .ok_or_else(|| anyhow!("no BANKS config for debt mint {debt_mint}"))?;
+    let collateral_bank = banks
+        .get(collateral_mint)
+        .ok_or_else(|| anyhow!("no BANKS config for collateral mint {collateral_mint}"))?;
+    Ok((debt_bank, collateral_bank))
+}
+
+fn static_accrued_ratio_bps(outstanding_debt_atoms: u64, principal_debt_atoms: u64) -> u32 {
     if principal_debt_atoms == 0 {
         return 0;
     }
     let ratio = (outstanding_debt_atoms as f64 / principal_debt_atoms as f64) * 10_000.0;
     ratio.clamp(0.0, u32::MAX as f64) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fresh_loan_skips_prefilter() {
+        assert!(static_accrued_ratio_bps(1_000_000, 1_000_000) < STATIC_LTV_PREFILTER_BPS);
+    }
+
+    #[test]
+    fn ratio_at_105_percent_meets_threshold() {
+        assert!(static_accrued_ratio_bps(1_050_000, 1_000_000) >= STATIC_LTV_PREFILTER_BPS);
+    }
+
+    #[test]
+    fn ratio_zero_principal_safe() {
+        assert_eq!(static_accrued_ratio_bps(100, 0), 0);
+    }
 }

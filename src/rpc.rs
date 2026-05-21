@@ -1,9 +1,3 @@
-//! Thin RPC client wrapper. Handles tx building, signing, priority-fee
-//! preamble, and a small retry on transient errors.
-//!
-//! We deliberately keep this lean — no transaction simulation helpers
-//! beyond what's needed for `CheckLtvLiquidatable` / `CheckMaturityLiquidatable`.
-
 use std::{
     sync::{atomic::AtomicBool, Arc},
     time::Duration,
@@ -27,10 +21,8 @@ use solana_sdk::{
 pub struct Rpc {
     client: Arc<RpcClient>,
     priority_fee_micro_lamports: u64,
-    /// Shared shutdown flag. When set, `send_with_retry` won't start
-    /// any new attempt — better to drop an in-flight retry than to
-    /// queue a new tx the supervisor is about to abort. Optional so
-    /// tests / one-off helpers can construct an `Rpc` without one.
+    /// When set, `send_with_retry` bails between attempts. We never
+    /// cancel an in-flight `send_and_confirm` — the tx might land.
     stop: Option<Arc<AtomicBool>>,
 }
 
@@ -47,10 +39,6 @@ impl Rpc {
         }
     }
 
-    /// Attach a shutdown flag so `send_with_retry` bails between
-    /// attempts when SIGTERM has fired. The flag is read with
-    /// `Ordering::Relaxed` — we only care that it's eventually
-    /// observed, not that it's synchronized with any other write.
     pub fn with_stop_signal(mut self, stop: Arc<AtomicBool>) -> Self {
         self.stop = Some(stop);
         self
@@ -67,13 +55,8 @@ impl Rpc {
         self.client.clone()
     }
 
-    /// Chunked + concurrent `getMultipleAccounts`. Splits `addresses`
-    /// into 100-account chunks (Solana RPC limit) and fetches up to 16
-    /// chunks concurrently via `tokio::task::JoinSet`. Order of the
-    /// returned `Vec` matches `addresses`.
-    ///
-    /// Replaces N round-trip `get_account_data` loops in handler ticks.
-    /// One RPC call per 100 accounts beats N calls of 1 every time.
+    /// Chunked + concurrent `getMultipleAccounts`. 100-account chunks
+    /// (RPC limit), up to 16 chunks in flight.
     pub async fn batch_get_multiple_accounts(
         &self,
         addresses: &[Pubkey],
@@ -85,14 +68,9 @@ impl Rpc {
             return Ok(Vec::new());
         }
 
-        // Pre-allocate so per-task results land in deterministic
-        // positions in the output, independent of completion order.
         let chunks: Vec<Vec<Pubkey>> = addresses.chunks(CHUNK_SIZE).map(|c| c.to_vec()).collect();
         let mut output: Vec<Option<solana_sdk::account::Account>> = vec![None; addresses.len()];
 
-        // Limit concurrency with a semaphore so we never have more than
-        // MAX_CONCURRENCY in-flight RPC requests; otherwise a huge
-        // discovery would queue 100+ concurrent requests at boot.
         let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENCY));
         let mut join_set: tokio::task::JoinSet<
             Result<(usize, Vec<Option<solana_sdk::account::Account>>)>,
@@ -125,13 +103,11 @@ impl Rpc {
         Ok(output)
     }
 
-    /// Fetch raw account data. Returns `None` if missing or zero-data.
     pub async fn get_account_data(&self, pk: &Pubkey) -> Result<Option<Vec<u8>>> {
         match self.client.get_account(pk).await {
             Ok(acct) if !acct.data.is_empty() => Ok(Some(acct.data)),
             Ok(_) => Ok(None),
             Err(e) => {
-                // Treat "not found" as None; surface everything else.
                 if format!("{e}").contains("AccountNotFound") {
                     Ok(None)
                 } else {
@@ -141,9 +117,6 @@ impl Rpc {
         }
     }
 
-    /// Build, sign, send, and confirm a tx with a priority-fee preamble.
-    /// `signers[0]` must be the fee payer. `ix_label` is a stable string
-    /// used as a metrics label (e.g. `"process_matched_loan"`).
     pub async fn send_signed(
         &self,
         ixs: Vec<Instruction>,
@@ -196,20 +169,13 @@ impl Rpc {
         let mut last_sig: Option<Signature> = None;
 
         for attempt in 0..3 {
-            // Bail between attempts if SIGTERM has fired. We deliberately
-            // don't try to cancel an in-flight `send_and_confirm` — that
-            // tx might land on-chain; better to let it finish and pay
-            // its fee than to leak a tx whose status we don't know.
             if self.stopped() {
                 return Err(anyhow!("shutdown signal received before send attempt"));
             }
 
-            // Before re-signing, check whether the previous attempt's
-            // signature actually landed. If it did but `send_and_confirm`
-            // returned an error (lost confirmation, RPC blip, etc.), we
-            // must not submit a second distinct signature for the same
-            // logical action — that's a double-pay of priority fees and,
-            // worse, can race the on-chain idempotency guards.
+            // If the prior attempt's signature actually landed, return
+            // it instead of re-signing — re-submission would race the
+            // on-chain idempotency guards.
             if let Some(prev) = last_sig {
                 match self.client.get_signature_statuses(&[prev]).await {
                     Ok(resp) => {
@@ -222,9 +188,6 @@ impl Rpc {
                         }
                     }
                     Err(e) => {
-                        // If we can't even check status, skip the
-                        // precheck rather than bail — preserve the
-                        // retry path for genuinely transient cases.
                         tracing::warn!(error = %e, "could not check prev sig status; proceeding to re-sign");
                     }
                 }
@@ -262,8 +225,6 @@ impl Rpc {
         unreachable!()
     }
 
-    /// Simulate a tx; return `Ok(())` if the program returned Ok,
-    /// `Err(...)` otherwise with the program error captured.
     pub async fn simulate(
         &self,
         ixs: Vec<Instruction>,
@@ -275,8 +236,6 @@ impl Rpc {
             Some(fee_payer),
             &blockhash,
         ));
-        // sig_verify=false lets us simulate without a real signer (only
-        // the fee_payer key is referenced; no signing keypair needed).
         let result = self
             .client
             .simulate_transaction_with_config(
@@ -295,22 +254,11 @@ impl Rpc {
         })
     }
 
-    /// Compute-budget preamble for every tx the bot sends.
-    ///
-    /// Sets both the per-CU price (priority fee) and an explicit CU
-    /// limit. The runtime defaults to a per-ix 200k allocation which
-    /// can both over-reserve fees and undersize a marginfi-CPI-heavy
-    /// liquidate tx. 1.4M is Solana's per-tx ceiling and is a *cap*,
-    /// not a charge — you only pay for CU actually consumed, so this
-    /// is free protection against tx failures that look like a "pay
-    /// more priority fee" problem when they're actually CU starvation.
+    /// CU limit set to 1.4M (Solana's per-tx ceiling). The limit is a
+    /// cap, not a charge — only consumed CU is billed — so this just
+    /// guards against truncation on marginfi-CPI-heavy txs.
     fn priority_fee_preamble(&self) -> Vec<Instruction> {
-        let mut ixs = vec![
-            // Always emit the CU-limit ix, even when priority_fee is 0,
-            // so handler txs always have headroom for marginfi CPI +
-            // oracle reads.
-            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
-        ];
+        let mut ixs = vec![ComputeBudgetInstruction::set_compute_unit_limit(1_400_000)];
         if self.priority_fee_micro_lamports > 0 {
             ixs.push(ComputeBudgetInstruction::set_compute_unit_price(
                 self.priority_fee_micro_lamports,
@@ -326,30 +274,19 @@ pub struct SimulationResult {
     pub error: Option<String>,
 }
 
-/// Classify a `solana-client` error as "safe to retry" vs "definitive".
-/// We match on the structured `ClientErrorKind` (and a narrow message
-/// substring for the blockhash case) so a program-level error whose
-/// `Display` happens to contain "connection" / "timed out" never
-/// triggers a retry.
+/// Classify safe-to-retry vs definitive errors. We match on the
+/// structured `ClientErrorKind` (with a narrow message match for the
+/// blockhash case) so a program error whose `Display` happens to
+/// contain "connection" or "timed out" can't accidentally trigger a
+/// retry.
 fn is_transient(e: &solana_client::client_error::ClientError) -> bool {
     match e.kind() {
-        // Network-level errors: io & reqwest. Always safe to retry.
         ClientErrorKind::Io(_) | ClientErrorKind::Reqwest(_) => true,
-        // RPC server errors in the JSON-RPC layer.
         ClientErrorKind::RpcError(rpc_err) => match rpc_err {
-            // Stale blockhash is the canonical "leader rejected, try
-            // again" case. The textual match here is narrow enough
-            // that program errors can't accidentally trigger it
-            // (the message comes from the server itself).
             RpcError::ForUser(msg) => msg.contains("Blockhash not found"),
-            // Server-side internal errors. Code range -32000..-32099
-            // is the JSON-RPC reserved server-error band.
             RpcError::RpcResponseError { code, .. } => (-32099..=-32000).contains(code),
             _ => false,
         },
-        // Anything else (TransactionError, SigningError, SerdeJson,
-        // Custom) is a definitive failure — retrying won't help and
-        // may make things worse.
         _ => false,
     }
 }

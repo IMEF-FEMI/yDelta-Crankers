@@ -1,46 +1,39 @@
-//! `ClaimRepaymentForRiskProfile` (tag 24) — drains repaid vault loans
-//! back to the GlobalVault.
-//!
-//! Discovery: for each (vault, profile) we manage (config-driven), pull
-//! loans straight from chain via `ChainReader::list_loans_for_profile`
-//! (a single `getProgramAccounts` per profile, filtered by
-//! `LoanFixed.lender_global_vault` + `lender_profile_id`), filter to
-//! `state == Repaid && now >= matures_at_unix`, fire the claim ix.
-//!
-//! Pass our fee-payer as `cranker_refund` — the on-chain processor
-//! refunds the loan PDA's rent to whoever matches `loan.created_by`.
-//! Same wallet that runs the promoter handler runs the claimer →
-//! rent-neutral pipeline.
+//! `ClaimRepaymentForRiskProfile` (tag 20). Closes the rent loop the
+//! promoter opened by passing the fee payer as `cranker_refund`.
 
-use std::{collections::HashSet, sync::Mutex};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Mutex,
+};
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use solana_program::pubkey::Pubkey;
 use solana_sdk::signature::Signer as _;
 use ydelta::program::instruction_builders::claim_repayment_for_risk_profile_instruction;
-use ydelta::state::loan::LoanState;
 use ydelta::state::OWNER_KIND_RISK_PROFILE;
 use ydelta::validation::get_lender_integration_account_address;
 
-use crate::chain_reader::LoanView;
+use crate::chain_reader::{LoanView, MarketView};
 
 use super::util::now_unix;
 use super::{Handler, HandlerContext};
 
 pub struct ClaimerHandler {
-    /// (vault, profile_id) targets discovered at first tick from the
-    /// curator config. Cached after first build.
-    discovered_targets: Mutex<Option<Vec<(Pubkey, u8)>>>,
     inflight: Mutex<HashSet<Pubkey>>,
 }
 
 impl ClaimerHandler {
     pub fn new() -> Self {
         Self {
-            discovered_targets: Mutex::new(None),
             inflight: Mutex::new(HashSet::new()),
         }
+    }
+}
+
+impl Default for ClaimerHandler {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -51,124 +44,67 @@ impl Handler for ClaimerHandler {
     }
 
     async fn tick(&self, ctx: &HandlerContext) -> Result<()> {
-        let targets = self.targets(ctx);
-        if targets.is_empty() {
+        let loans = ctx.chain.list_repaid_vault_loans().await?;
+        if loans.is_empty() {
             return Ok(());
         }
+
         let t_now = now_unix();
-
-        let mut total_claimed = 0;
-        for (vault, profile_id) in &targets {
-            match self.claim_for_profile(ctx, vault, *profile_id, t_now).await {
-                Ok(n) => total_claimed += n,
-                Err(e) => tracing::warn!(
-                    vault = %vault,
-                    profile_id,
-                    error = %e,
-                    "claim_for_profile failed"
-                ),
-            }
-        }
-        if total_claimed > 0 {
-            tracing::info!(total_claimed, "claimer tick");
-        }
-        Ok(())
-    }
-}
-
-impl ClaimerHandler {
-    fn targets(&self, ctx: &HandlerContext) -> Vec<(Pubkey, u8)> {
-        if let Some(t) = self.discovered_targets.lock().unwrap().clone() {
-            return t;
-        }
-        // Targets are every (vault, profile_id) the curator config mentions.
-        // The fee-payer can claim for any vault loan regardless of who
-        // operates the curator — tag 24 is permissionless. We restrict
-        // to managed targets to keep the indexer query volume bounded.
-        let out: Vec<_> = ctx
-            .cfg
-            .curator_signers
-            .iter()
-            .map(|c| (c.global_vault, c.profile_id))
-            .collect();
-        *self.discovered_targets.lock().unwrap() = Some(out.clone());
-        out
-    }
-
-    async fn claim_for_profile(
-        &self,
-        ctx: &HandlerContext,
-        vault: &Pubkey,
-        profile_id: u8,
-        now_unix: i64,
-    ) -> Result<usize> {
-        let loans = ctx
-            .chain
-            .list_loans_for_profile(vault, profile_id)
-            .await?;
+        let markets = ctx.chain.list_markets().await?;
+        let markets_by_pk: HashMap<Pubkey, &MarketView> =
+            markets.iter().map(|m| (m.address, m)).collect();
 
         let candidates: Vec<&LoanView> = loans
             .iter()
-            .filter(|l| l.state == LoanState::Repaid as u8)
             .filter(|l| l.lender_kind == OWNER_KIND_RISK_PROFILE)
-            .filter(|l| now_unix >= l.matures_at_unix)
+            .filter(|l| t_now >= l.matures_at_unix)
             .collect();
 
-        if candidates.is_empty() {
-            return Ok(0);
-        }
-
         let mut claimed = 0;
-        for c in candidates {
-            let loan_pk = c.address;
+        for loan in candidates {
+            let loan_pk = loan.address;
             if !self.claim_inflight(loan_pk) {
                 continue;
             }
-            let res = self.claim_one(ctx, vault, c).await;
+            let res = self.claim_one(ctx, loan, &markets_by_pk).await;
             self.release_inflight(loan_pk);
             match res {
                 Ok(()) => claimed += 1,
                 Err(e) => tracing::warn!(loan = %loan_pk, error = %e, "claim_one failed"),
             }
         }
-        Ok(claimed)
+        if claimed > 0 {
+            tracing::info!(claimed, "claimer tick");
+        }
+        Ok(())
     }
+}
 
+impl ClaimerHandler {
     fn claim_inflight(&self, loan: Pubkey) -> bool {
-        let mut s = self.inflight.lock().unwrap();
-        s.insert(loan)
+        self.inflight.lock().unwrap().insert(loan)
     }
 
     fn release_inflight(&self, loan: Pubkey) {
-        let mut s = self.inflight.lock().unwrap();
-        s.remove(&loan);
+        self.inflight.lock().unwrap().remove(&loan);
     }
 
     async fn claim_one(
         &self,
         ctx: &HandlerContext,
-        vault: &Pubkey,
         loan: &LoanView,
+        markets_by_pk: &HashMap<Pubkey, &MarketView>,
     ) -> Result<()> {
-        // `matched_loan_sequence` already lives on the `LoanFixed`
-        // header, so the chain-side `LoanView` carries it natively —
-        // no extra read needed.
-        let sequence = loan.matched_loan_sequence;
-
         let market_pk = loan.market;
-        let market_view = ctx
-            .chain
-            .list_markets()
-            .await?
-            .into_iter()
-            .find(|m| m.address == market_pk)
+        let market = *markets_by_pk
+            .get(&market_pk)
             .ok_or_else(|| anyhow!("market {market_pk} not found on chain"))?;
-        let debt_mint = market_view.debt_mint;
-        let debt_bank = ctx
-            .cfg
-            .banks
+        let debt_mint = market.debt_mint;
+        let banks = ctx.cfg.banks_snapshot();
+        let debt_bank = banks
             .get(&debt_mint)
-            .ok_or_else(|| anyhow!("no BANKS config for debt mint {debt_mint}"))?;
+            .ok_or_else(|| anyhow!("no BANKS config for debt mint {debt_mint}"))?
+            .clone();
 
         let (lender_marginfi, _) = get_lender_integration_account_address(&market_pk);
 
@@ -178,18 +114,19 @@ impl ClaimerHandler {
         let ix = claim_repayment_for_risk_profile_instruction(
             &payer_pk,
             &market_pk,
-            sequence,
-            vault,
+            loan.matched_loan_sequence,
+            &loan.lender_global_vault,
             &debt_mint,
             &debt_bank.bank,
             &debt_bank.liquidity_vault,
             &debt_bank.liquidity_vault_authority,
+            // `load_vault_settle_accounts` reads exactly one oracle.
             &debt_bank.primary_oracle(),
             &lender_marginfi,
             &debt_bank.token_program,
             &ctx.cfg.marginfi_group,
             &ctx.cfg.marginfi_program_id,
-            Some(&payer_pk), // cranker_refund — recovers tag-7 rent if we created it
+            Some(&payer_pk),
         );
 
         let sig = ctx
@@ -198,6 +135,8 @@ impl ClaimerHandler {
             .await?;
         tracing::info!(
             loan = %loan.address,
+            vault = %loan.lender_global_vault,
+            profile_id = loan.lender_profile_id,
             sig = %sig,
             "vault loan claimed"
         );

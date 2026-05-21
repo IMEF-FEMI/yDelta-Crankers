@@ -1087,9 +1087,9 @@ dependencies = [
 
 [[package]]
 name = "dashmap"
-version = "6.1.0"
+version = "6.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5041cc499144891f3790297212f32a74fb938e5136a14943f338ef9e0ae276cf"
+checksum = "e6361d5c062261c78a176addb82d4c821ae42bed6089de0e12603cd25de2059c"
 dependencies = [
  "cfg-if",
  "crossbeam-utils",
@@ -1983,7 +1983,7 @@ dependencies = [
 [[package]]
 name = "hypertree"
 version = "1.1.0"
-source = "git+https://github.com/IMEF-FEMI/yDelta.git?rev=68f174042637a99b8025ed2c0ef60d4c20357659#68f174042637a99b8025ed2c0ef60d4c20357659"
+source = "git+https://github.com/IMEF-FEMI/yDelta.git?rev=c00a0fa08737febd807118cf910e61f84a35289b#c00a0fa08737febd807118cf910e61f84a35289b"
 dependencies = [
  "bytemuck",
  "solana-program",
@@ -2399,7 +2399,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 [[package]]
 name = "marginfi-mocks"
 version = "0.1.0"
-source = "git+https://github.com/IMEF-FEMI/yDelta.git?rev=68f174042637a99b8025ed2c0ef60d4c20357659#68f174042637a99b8025ed2c0ef60d4c20357659"
+source = "git+https://github.com/IMEF-FEMI/yDelta.git?rev=c00a0fa08737febd807118cf910e61f84a35289b#c00a0fa08737febd807118cf910e61f84a35289b"
 dependencies = [
  "borsh 0.10.4",
  "bytemuck",
@@ -6600,7 +6600,7 @@ dependencies = [
 [[package]]
 name = "switchboard-on-demand-client"
 version = "0.5.1"
-source = "git+https://github.com/switchboard-xyz/switchboard-sdk?rev=7fce771e8af381058e69d8911c777e93dc20c81c#7fce771e8af381058e69d8911c777e93dc20c81c"
+source = "git+https://github.com/switchboard-xyz/switchboard-sdk?branch=main#7fce771e8af381058e69d8911c777e93dc20c81c"
 dependencies = [
  "anyhow_ext",
  "arrayref",
@@ -6610,7 +6610,7 @@ dependencies = [
  "borsh 0.9.3",
  "bs58 0.4.0",
  "bytemuck",
- "dashmap 6.1.0",
+ "dashmap 6.2.1",
  "futures",
  "hex",
  "lazy_static",
@@ -7905,7 +7905,7 @@ dependencies = [
 [[package]]
 name = "ydelta"
 version = "0.1.0"
-source = "git+https://github.com/IMEF-FEMI/yDelta.git?rev=68f174042637a99b8025ed2c0ef60d4c20357659#68f174042637a99b8025ed2c0ef60d4c20357659"
+source = "git+https://github.com/IMEF-FEMI/yDelta.git?rev=c00a0fa08737febd807118cf910e61f84a35289b#c00a0fa08737febd807118cf910e61f84a35289b"
 dependencies = [
  "arrayref",
  "borsh 0.10.4",

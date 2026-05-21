@@ -1,79 +1,98 @@
 # ydelta-crankers
 
-Off-chain keeper bots for the [yDelta](../ydelta) protocol. Five
-cranking services in one binary, each running its own poll loop with
-shared RPC state. State discovery is entirely chain-driven —
-`getProgramAccounts` against the ydelta program for markets/loans, plus
-in-place hypertree walks on `MarketFixed` and `GlobalVaultFixed` for
-order books, matched-loan queues, and risk profiles. No indexer
-endpoint.
+Off-chain keeper bots for the [yDelta](../ydelta) protocol. Three
+permissionless cranking services in one binary, each running its own
+poll loop with shared RPC state. State discovery is entirely
+chain-driven — `getProgramAccounts` against the ydelta program for
+markets and loans, plus in-place hypertree walks on `MarketFixed` for
+matched-loan queues. No indexer endpoint.
+
+The protocol moved to a **one-sided** model: only vault risk-profile
+asks rest on the book. Borrowers place IOC bids that either cross
+immediately, fall back to a `LoanType::P2Pool` marginfi-borrow node, or
+drop. Matches still queue async in `market.matched_loans` and need
+cranking.
 
 ## Cranking services
 
-This program operates the following crankers against the on-chain yDelta
-program. Each runs as an independent handler with its own interval +
-enable flag.
+This binary runs the following crankers against the on-chain yDelta
+program. Each handler is independent and gated by a `*_ENABLED` env
+flag. The first three are permissionless and sign with the fee payer;
+the fourth signs with per-curator keypairs.
 
 1. **`promoter`** — promotes new `MatchedLoan` queue entries into live
-   `LoanFixed` PDAs (tag 7 `ProcessMatchedLoan`). Handles primary,
-   secondary-full, and secondary-split crosses; assembles vault settlement
-   accounts when the lender is a risk profile. Pays loan-PDA rent.
-2. **`liquidator`** — settles matured loans (tag 20 `SettleMaturedLoan`)
-   and liquidates LTV-breach loans (tag 21 `LiquidateLoan`). Pre-flighted
-   via simulation-only gates (tag 40 `CheckLtvLiquidatable`, tag 41
-   `CheckMaturityLiquidatable`) so we only submit txs that will land.
-3. **`claimer`** — drains fully-repaid risk-profile-funded loans back into
-   the GlobalVault (tag 24 `ClaimRepaymentForRiskProfile`). Recovers the
-   rent the promoter paid via the `cranker_refund` slot.
-4. **`policy_sync`** — re-stamps `risk_profile_max_ltv_bps` on every
-   market-side vault seat after a curator runs `UpdateRiskProfile`
-   (tag 38 `SyncMarketSeatsForRiskProfile`). Triggered by indexer events,
-   batched ≤8 markets per ix.
-5. **`curator_keeper`** — keeps each managed vault ask in sync with the
-   target rate (tag 18 `UpdateOrderForRiskProfile`). Supports both static
-   rates and dynamic marginfi-following (`target = supply + α × (borrow - supply)`).
-   The quoted rate is clamped to `[marginfi_supply_apr, marginfi_borrow_apr]`;
-   if marginfi's curve is inverted (`borrow ≤ supply`), the keeper quotes
-   at `supply` so LPs never earn below the marginfi-supply baseline.
-   When no live ask exists yet, the keeper bootstraps the
-   `(vault, profile, market)` end-to-end: if the vault-owned
-   `ClaimedSeat` is also missing, it bundles `ClaimSeatForRiskProfile`
-   (tag 15) + `PlaceOrderForRiskProfile` (tag 16) into one atomic tx
-   so the order is live in a single round-trip. Both ixs are signed
-   by the per-profile curator keypair (the yDelta program gates both
-   on `signer == profile.curator`).
+   `LoanFixed` PDAs (tag 5 `ProcessMatchedLoan`). One ix path: dispatch
+   on the node's `loan_type` and `flags` to decide whether to pass the
+   trailing 15-account `VaultSettleAddrs` bundle (required for Fixed
+   loans with a vault lender, skipped for `VAULT_PRESETTLED` nodes
+   emitted by `ConvertP2PoolToFixed`, and skipped for P2Pool loans).
+   Pays loan-PDA rent (refunded at claim time).
+2. **`liquidator`** — settles matured loans (tag 16 `SettleMaturedLoan`)
+   and liquidates LTV-breach loans (tag 17 `LiquidateLoan`), pre-flighted
+   by `CheckLtvLiquidatable` (tag 34) / `CheckMaturityLiquidatable`
+   (tag 35) sims. On loans that are BOTH matured and under-water the
+   liquidator tries `liquidate_loan` first to capture the keeper bonus,
+   falling back to `settle_matured_loan` on sim failure. When the
+   fee-payer's debt ATA can't fund a full repay, a partial settle/
+   liquidate is submitted (respecting the program's 1% / 1000-atom
+   floor) so an underfunded ATA never deadlocks a large loan. Same
+   handler covers Fixed and P2Pool loan bodies — the program branches
+   inside the processor.
+3. **`claimer`** — drains fully-repaid vault-funded loans back to the
+   GlobalVault (tag 20 `ClaimRepaymentForRiskProfile`). Recovers the
+   rent the promoter paid via the `cranker_refund` slot. Discovery is
+   permissionless and curator-config-free: one
+   `getProgramAccounts(LoanFixed, state=Repaid, lender_kind=RiskProfile)`
+   per tick, client-side filtered by `now >= matures_at_unix`.
+4. **`curator_fee_claimer`** *(opt-in)* — drains
+   `RiskProfile.accumulated_curator_fee_atoms` to each curator's wallet
+   ATA on a configurable cadence (default 1h, tag 15
+   `ClaimCuratorFee`). Signs with the per-curator keypair loaded from
+   `CURATOR_KEYPAIRS_JSON`. Discovery: one
+   `getProgramAccounts(GlobalVaultFixed)` per tick plus an in-place
+   walk of each vault's `risk_profiles` tree; skips profiles whose
+   curator key we don't hold and profiles below
+   `MIN_CURATOR_FEE_CLAIM_ATOMS`.
 
-| Handler | Instructions | Signer | Permissionless? |
-|---|---|---|---|
-| `promoter` | tag 7 | fee payer | yes |
-| `liquidator` | tag 20, 21 (+ sim 40, 41) | fee payer | yes |
-| `claimer` | tag 24 | fee payer | yes |
-| `policy_sync` | tag 38 | fee payer | yes |
-| `curator_keeper` | tag 18 | per-profile curator key | no — curator-gated |
+| Handler | Instructions | Sim gate | Signer | Permissionless? |
+|---|---|---|---|---|
+| `promoter` | tag 5 | — | fee payer | yes |
+| `liquidator` | tag 16, 17 | tag 34, 35 | fee payer | yes |
+| `claimer` | tag 20 | — | fee payer | yes |
+| `curator_fee_claimer` | tag 15 | — | curator keypair | curator-gated |
+
+**Not cranker territory.** `PlaceOrderForRiskProfile` (tag 12),
+`CancelOrderForRiskProfile` (tag 13), and `UpdateOrderForRiskProfile`
+(tag 14) require `signer == profile.curator` *and* a live strategy
+decision — those are exclusively a UI concern. Same for
+`ConvertP2PoolToFixed` (tag 33), which requires the borrower signer.
+`ProtocolFeeClaim` (tag 19) requires the per-market admin and is
+expected to run as a one-shot operator script.
 
 ## Architecture
 
 ```
-                              ┌── getProgramAccounts(MarketFixed)
-                              ├── getProgramAccounts(LoanFixed, market | vault+profile filter)
-RPC  ◄──────  cranker  ──────►├── getAccountInfo(MarketFixed)  ── walk hypertree (asks/bids/matched_loans)
-                              ├── getAccountInfo(GlobalVaultFixed) ── walk risk_profiles tree
+                              ┌── getProgramAccounts(MarketFixed)        (markets, 30s TTL)
+                              ├── getProgramAccounts(LoanFixed,
+RPC  ◄──────  cranker  ──────►│       market | state+lender_kind filter) (loans)
+                              ├── getAccountInfo(MarketFixed)             (matched-loan walk)
                               └── Tx ── ix submission
 ```
 
 No Geyser, no WebSocket subscriptions, no indexer. Candidate discovery
 is `getProgramAccounts` on the ydelta program filtered by account
-discriminator (and `market` / `lender_global_vault` memcmps where it
-narrows the set). Dynamic-region data — order books, matched-loan
-queues, vault risk profiles — is fetched via `getAccountInfo` and
-walked in-place with the hypertree iterators from the program crate.
+discriminator plus targeted memcmps:
 
-A short-TTL in-process cache (`ChainReader::list_markets`, 30s)
-deduplicates the market list across handler ticks so the bot makes
-one `getProgramAccounts(MarketFixed)` per ~30s rather than per
-handler-tick.
+- Markets — discriminator only (small set; cached 30s).
+- Loans for the liquidator — discriminator + `market` memcmp at offset 8.
+- Loans for the claimer — discriminator + `state == Repaid` (offset
+  196) + `lender_kind == RISK_PROFILE` (offset 201). One query covers
+  every vault, every profile, every market.
+- Matched-loan queues — read from the `MarketFixed` dynamic region
+  in-place via `hypertree` iterators that ship with the program crate,
+  so the on-disk layout can never drift.
 
-When the LTV liquidator hits competitive pressure (third-party keepers
+When the LTV liquidator faces competitive pressure (third-party keepers
 racing for the bonus), swap the candidate source for a Geyser stream.
 The handler loops won't change.
 
@@ -87,43 +106,41 @@ crankers/
 └── src/
     ├── main.rs           sigterm/sigint, init handlers, supervise
     ├── config.rs         env → typed Config
-    ├── signer.rs         load Keypair JSON files
+    ├── signer.rs         load fee-payer keypair from JSON file or base58
     ├── rpc.rs            send + sim + retry; priority-fee preamble
-    ├── chain_reader.rs   on-chain state reader (markets, loans, orders,
-    │                       risk profiles, matched-loan queues) — full
-    │                       replacement for the indexer client
+    ├── chain_reader.rs   on-chain state reader (markets, loans, matched-
+    │                       loan queues)
     ├── bank_registry.rs  per-mint marginfi bank metadata, chain-driven
+    ├── marginfi_bank.rs  bytemuck decoder for the marginfi Bank account
+    ├── metrics.rs        Prometheus exposition + classifier
+    ├── health_server.rs  /healthz + /readyz
     └── handlers/
-        ├── mod.rs            Handler trait + supervisor
-        ├── util.rs           shared helpers (now_unix, token program id)
-        ├── promoter.rs       tag 7
-        ├── claimer.rs        tag 24
-        ├── liquidator.rs     tag 20 + 21 (+ sim 40, 41)
-        ├── policy_sync.rs    tag 38
-        └── curator_keeper.rs tag 18
+        ├── mod.rs               Handler trait + supervisor
+        ├── util.rs              shared helpers (now_unix, P2Pool stage math)
+        ├── promoter.rs          tag 5
+        ├── liquidator.rs        tag 16 + 17 (sim 34, 35)
+        ├── claimer.rs           tag 20
+        └── curator_fee_claimer.rs   tag 15 (opt-in, per-curator signer)
 ```
 
 The cranker **depends on the `ydelta` program crate as a git dep**
 pinned to a specific revision of
 [IMEF-FEMI/yDelta](https://github.com/IMEF-FEMI/yDelta), with
 `features = ["no-entrypoint"]`. This gives us — for free — every ix
-builder, account type, and PDA helper the program defines. We never
-duplicate the on-chain layout.
+builder, account type, and PDA helper the program defines. The on-disk
+layout can't drift.
 
-`ydelta` itself is treated as packaged upstream — we consume it from
-its own repo at a pinned rev, never modify it from this project.
-Bump the rev in `Cargo.toml` whenever ydelta ships a change the
-cranker needs.
+`ydelta` is treated as packaged upstream — we consume it at a pinned
+rev, never modify it from this project. Bump the rev in `Cargo.toml`
+whenever ydelta ships a change the cranker needs.
 
 ## Local dev
 
-Prereqs: Rust 1.90 (set in `rust-toolchain.toml` — newer than the
-program crate because the cranker builds for the host and gets pulled
-into the modern `solana-zk-sdk` graph) and a Solana RPC endpoint.
+Prereqs: Rust 1.90 (set in `rust-toolchain.toml`) and a Solana RPC
+endpoint.
 
 yDelta runs on **localhost** (solana-test-validator) and **mainnet**
-only. Point `RPC_URL` at the appropriate endpoint and seed `BANKS` /
-`LIQUIDATOR_*` with addresses for that target.
+only. Point `RPC_URL` at the appropriate endpoint.
 
 ```sh
 # From frontier_2026/crankers
@@ -131,35 +148,21 @@ cp .env.example .env
 # Fill in:
 #   - RPC_URL
 #   - FEE_PAYER_KEYPAIR (path to a funded keypair JSON)
-#   - MARGINFI_GROUP + MARGINFI_PROGRAM_ID
-#   - CURATORS (if running the curator keeper)
+#     or FEE_PAYER_KEYPAIR_BASE58 (inline secret)
+#   - MARGINFI_PROGRAM_ID + MARGINFI_GROUP
 #
 # Bank metadata and the liquidator's ATAs are derived from chain at
-# boot — no env entry needed.
+# boot — no env entry needed. You DO still need to fund the fee
+# payer's debt-mint ATA before the liquidator can settle anything.
 
 cargo run --release
 ```
 
 Disable handlers you don't want to run via the `*_ENABLED=false` env vars.
 
-### One-shot helpers
-
-`src/bin/` carries small standalone binaries that reuse the same Config /
-Signers / Rpc plumbing the supervisor uses. They read the same `.env`,
-so once your dev env works for the main bot it works for these too.
-
-- `place_order` — submit a single primary `PlaceOrder` ix on the
-  SOL/USDC market, signed by the fee payer. Defaults to a $10 USDC
-  Limit Ask at 7.20% APY / 14d term; override via
-  `PLACE_ORDER_SIDE` / `PLACE_ORDER_PRINCIPAL_ATOMS` /
-  `PLACE_ORDER_RATE_BPS` / `PLACE_ORDER_TERM_SECONDS` /
-  `PLACE_ORDER_COLLATERAL_ATOMS` / `PLACE_ORDER_LAST_VALID_TS` /
-  `PLACE_ORDER_FLAGS`. Asks require pre-deposited USDC on the
-  signer's seat; Bids require pre-deposited wSOL collateral.
-
-  ```sh
-  cargo run --release --bin place_order
-  ```
+To iterate on an unpushed `ydelta` change, uncomment the `[patch.…]`
+block at the bottom of `Cargo.toml` so the cranker builds against
+`../ydelta`. Re-comment + bump the `rev` once the change is pushed.
 
 ## Railway deploy
 
@@ -170,13 +173,14 @@ so once your dev env works for the main bot it works for these too.
    - Builder: Dockerfile (auto-detected via `railway.toml`).
    - Start command: image `ENTRYPOINT` (no override needed).
 2. **Set environment variables** in the service's _Variables_ tab. Use
-   `.env.example` as the contract. Mount keypair files via Railway's
-   "Files" / secret-file mechanism and reference them by absolute path
-   (`/secrets/fee-payer.json`, etc.) — never inline base58.
+   `.env.example` as the contract. Mount the keypair file via Railway's
+   "Files" / secret-file mechanism and reference it by absolute path
+   (`/secrets/fee-payer.json`), or use `FEE_PAYER_KEYPAIR_BASE58` for
+   an inline secret.
 3. **Grafana Cloud metrics.** The bot exposes Prometheus exposition on
    `$METRICS_BIND` (default `0.0.0.0:9091`) at `/metrics`. Point
    Grafana Cloud's hosted Prometheus at this URL via a scrape config
-   in your stack; the free tier handles our volume comfortably.
+   in your stack.
    - Metrics emitted: `ydelta_cranker_ticks_total{handler,outcome}`,
      `ydelta_cranker_tick_duration_seconds{handler}`,
      `ydelta_cranker_ixs_submitted_total{ix,outcome}`,
@@ -188,35 +192,19 @@ so once your dev env works for the main bot it works for these too.
 
 Every handler talks to the RPC directly via `ChainReader`:
 
-- `getProgramAccounts(ydelta, filter=MarketFixed-discrim, data_size=512)`
-  — used at boot (bank discovery) and on a 30s TTL cache during normal
-  operation. Drives the markets list every handler reads.
+- `getProgramAccounts(ydelta, filter=MarketFixed-discrim)` — boot
+  (bank discovery), then on a 30s TTL cache + a 5-minute background
+  refresh so newly-created markets surface without a restart.
 - `getProgramAccounts(ydelta, filter=LoanFixed-discrim + market memcmp)`
   — liquidator per-market scan.
-- `getProgramAccounts(ydelta, filter=LoanFixed-discrim + lender_global_vault +
-  lender_profile_id memcmps)` — claimer per-profile scan.
-- `getAccountInfo(market)` — promoter (matched-loan queue walk),
-  curator keeper (asks tree walk for the managed order), liquidator
-  (seat lookups).
-- `getAccountInfo(global_vault)` — policy_sync (read live
-  `RiskProfile.active_markets`).
+- `getProgramAccounts(ydelta, filter=LoanFixed-discrim + state=Repaid
+  + lender_kind=RiskProfile)` — claimer scan, single query covers
+  every vault.
+- `getProgramAccounts(ydelta, filter=GlobalVaultFixed-discrim)` —
+  curator-fee-claimer scan (in-place walk of each vault's
+  `risk_profiles` tree).
+- `getAccountInfo(market)` — promoter (matched-loan queue walk +
+  defense-in-depth seat-kind check).
 
 Hypertree walks live in-process via the `hypertree` crate that ships
 alongside the program, so the on-disk layout can't drift.
-
-## Known v1 limitations
-
-All material correctness gaps have been closed. Remaining items are
-scope decisions, not bugs:
-
-- **Bank registry is env-driven** via `BANKS`. The cranker reads the
-  marginfi Bank for live rates (curator keeper) but still needs to
-  know each bank's pubkey + liquidity-vault + LVA. v2 follow-up:
-  auto-discover from marginfi `getProgramAccounts` filtered by
-  `(mint, group)`.
-- **No rent-receivables ledger.** The promoter passes its own fee-payer
-  pubkey as `cranker_refund` at claim time. Rent recovery works as long
-  as one wallet runs both promoter and claimer (the default). If we
-  later split signers, add an explicit ledger of outstanding rent
-  obligations keyed by loan-PDA.
-

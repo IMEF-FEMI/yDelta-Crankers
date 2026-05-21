@@ -1,23 +1,5 @@
-//! Per-mint marginfi-bank metadata.
-//!
-//! No env input. The cranker discovers every bank it cares about by:
-//!   1. Listing markets on chain via `ChainReader::list_markets`
-//!      (a single `getProgramAccounts` against the ydelta program id
-//!      filtered by the `MarketFixed` discriminator).
-//!   2. Reading each `MarketFixed` to pull the four pubkeys it stores
-//!      natively: `debt_mint`, `debt_lending_pool`, `collateral_mint`,
-//!      `collateral_lending_pool` (the two `*_lending_pool` fields are
-//!      the marginfi `Bank` pubkeys).
-//!   3. De-duplicating across markets and reading each unique `Bank`
-//!      account to extract `liquidity_vault`, the LVA bump, and the
-//!      oracle list. The LVA pubkey is derived from the bump via the
-//!      canonical PDA seed (`"liquidity_vault_auth"`).
-//!   4. Fetching each mint to determine its SPL token program
-//!      (legacy vs token-2022).
-//!
-//! ATAs (liquidator's debt + collateral token accounts) are deterministic
-//! PDAs of `(owner, token_program, mint)` — derived on demand via
-//! `BankInfo::ata_for`. No env config for those either.
+//! Per-mint marginfi bank metadata, chain-discovered at boot from
+//! `MarketFixed.{debt,collateral}_lending_pool`.
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -35,18 +17,14 @@ use crate::chain_reader::ChainReader;
 use crate::marginfi_bank::BankView;
 use crate::rpc::Rpc;
 
-/// SPL Associated Token Account program id. Constant across mainnet +
-/// localnet, no env override.
 fn ata_program_id() -> Pubkey {
     Pubkey::from_str("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL").unwrap()
 }
 
-/// Legacy spl-token program id.
 pub fn spl_token_legacy_id() -> Pubkey {
     Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap()
 }
 
-/// Token-2022 program id.
 pub fn spl_token_2022_id() -> Pubkey {
     Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").unwrap()
 }
@@ -57,17 +35,19 @@ pub struct BankInfo {
     pub bank: Pubkey,
     pub liquidity_vault: Pubkey,
     pub liquidity_vault_authority: Pubkey,
-    /// 1-5 oracle pubkeys. The vault-settle CPI path uses oracles[0] only
-    /// (per the on-chain loader); the settle/liquidate paths pass the
-    /// full slice through as the bank's active-balance health-check tail.
+    /// 1-5 oracle pubkeys. The vault-settle CPI path uses `oracles[0]`
+    /// only; settle/liquidate paths pass the full slice through.
     pub oracles: Vec<Pubkey>,
-    /// `spl_token_legacy_id()` or `spl_token_2022_id()`. Defaults to
-    /// legacy when not specified in env.
     pub token_program: Pubkey,
+    /// marginfi `OracleSetup` discriminant. `4 == SwitchboardPull` — the
+    /// only pull-based (must-crank) setup our markets use.
+    pub oracle_setup: u8,
 }
 
+/// marginfi `OracleSetup::SwitchboardPull`.
+const ORACLE_SETUP_SWITCHBOARD_PULL: u8 = 4;
+
 impl BankInfo {
-    /// Convenience for builders that take a single primary oracle.
     pub fn primary_oracle(&self) -> Pubkey {
         self.oracles
             .first()
@@ -75,11 +55,12 @@ impl BankInfo {
             .unwrap_or_else(Pubkey::default)
     }
 
-    /// SPL Associated Token Account for `owner` holding `self.mint`
-    /// under `self.token_program`. The ATA program ID is constant; the
-    /// derivation is deterministic, so the operator doesn't need to
-    /// configure these — they only need to *fund* the debt-side ones
-    /// for the liquidator before the bot runs.
+    /// True for Switchboard On-Demand pull feeds, which the cranker must
+    /// refresh itself (Pyth-Push feeds are kept fresh by Pyth-DA).
+    pub fn is_switchboard_pull(&self) -> bool {
+        self.oracle_setup == ORACLE_SETUP_SWITCHBOARD_PULL
+    }
+
     pub fn ata_for(&self, owner: &Pubkey) -> Pubkey {
         let (ata, _bump) = Pubkey::find_program_address(
             &[
@@ -98,30 +79,15 @@ pub struct BankRegistry {
     by_mint: HashMap<Pubkey, BankInfo>,
 }
 
-/// PDA seed for the marginfi liquidity-vault authority. Mirrors the
-/// `LIQUIDITY_VAULT_AUTHORITY_SEED` constant in marginfi-v2's type
-/// crate. Don't change this — must match the on-chain program byte-for-byte.
+/// Mirrors marginfi-v2's `LIQUIDITY_VAULT_AUTHORITY_SEED` byte-for-byte.
 const LIQUIDITY_VAULT_AUTHORITY_SEED: &[u8] = b"liquidity_vault_auth";
 
 impl BankRegistry {
-    /// Discover every bank touched by any market the indexer surfaces,
-    /// then resolve each one's full metadata from chain. Order:
-    ///
-    ///   1. Indexer → list of markets.
-    ///   2. Each market → `MarketFixed.{debt,collateral}_lending_pool`
-    ///      (the marginfi `Bank` pubkeys, stored natively on the market
-    ///      account). Read via `market_reader::read_market_bank_bindings`.
-    ///   3. Dedupe (mint, bank) pairs across markets.
-    ///   4. Resolve each unique bank's metadata via the existing
-    ///      chain-reading path.
     pub async fn discover_from_markets(
         rpc: &Rpc,
         chain: &ChainReader,
         marginfi_program: &Pubkey,
     ) -> Result<Self> {
-        // One `getProgramAccounts(MarketFixed)` returns every market on
-        // chain, fully decoded, in a single RPC round-trip — no per-
-        // market follow-up read needed.
         let markets = chain
             .refresh_markets()
             .await
@@ -131,12 +97,11 @@ impl BankRegistry {
             return Ok(Self::default());
         }
 
+        // Refuse to start if two markets bind the same mint to
+        // different banks — different oracles + rates would silently
+        // corrupt liquidator math.
         let mut mint_to_bank: HashMap<Pubkey, Pubkey> = HashMap::new();
         for m in &markets {
-            // If two markets bind the same mint to different banks, we
-            // refuse to start — that's a misconfiguration we can't
-            // silently paper over (different banks = different oracles
-            // and rates).
             if let Some(prev) = mint_to_bank.insert(m.debt_mint, m.debt_bank) {
                 if prev != m.debt_bank {
                     bail!(
@@ -169,10 +134,6 @@ impl BankRegistry {
         Self::resolve_from_chain(rpc.client().as_ref(), marginfi_program, &mint_to_bank).await
     }
 
-    /// Chain-read pass: given a `{mint → bank}` map, fetch each bank
-    /// account, validate ownership + mint, derive the LVA pubkey from
-    /// the on-chain bump, resolve each mint's SPL token program.
-    /// Reused internally by `discover_from_markets`.
     async fn resolve_from_chain(
         rpc: &RpcClient,
         marginfi_program: &Pubkey,
@@ -182,7 +143,6 @@ impl BankRegistry {
             return Ok(Self::default());
         }
 
-        // Stable ordering so error messages reproduce consistently.
         let mut entries: Vec<(Pubkey, Pubkey)> =
             mint_to_bank.iter().map(|(m, b)| (*m, *b)).collect();
         entries.sort_by_key(|(m, _)| m.to_bytes());
@@ -193,8 +153,6 @@ impl BankRegistry {
             .await
             .context("BANKS resolve: get_multiple_accounts(banks) failed")?;
 
-        // First pass: decode each bank, validate ownership + mint match,
-        // collect mints for the second pass (token-program resolution).
         let mut decoded: Vec<(Pubkey, Pubkey, BankView, Pubkey)> =
             Vec::with_capacity(entries.len());
         let mut mint_pubkeys: Vec<Pubkey> = Vec::with_capacity(entries.len());
@@ -219,7 +177,6 @@ impl BankRegistry {
                     view.mint
                 );
             }
-            // Derive the LVA pubkey from the bump stored on the bank.
             let lva = Pubkey::create_program_address(
                 &[
                     LIQUIDITY_VAULT_AUTHORITY_SEED,
@@ -238,8 +195,6 @@ impl BankRegistry {
             decoded.push((*expected_mint, *bank_pk, view, lva));
         }
 
-        // Second pass: fetch each mint to figure out its SPL token
-        // program. Legacy spl-token and token-2022 are owner-discriminated.
         let mint_accounts = rpc
             .get_multiple_accounts(&mint_pubkeys)
             .await
@@ -275,6 +230,7 @@ impl BankRegistry {
                     liquidity_vault_authority: *lva,
                     oracles: view.oracles.clone(),
                     token_program,
+                    oracle_setup: view.oracle_setup,
                 },
             );
         }
@@ -285,6 +241,16 @@ impl BankRegistry {
         self.by_mint.get(mint)
     }
 
+    /// True if any discovered bank uses a Switchboard On-Demand pull feed —
+    /// i.e. the swb cranker is worth booting.
+    pub fn has_switchboard_pull(&self) -> bool {
+        self.by_mint.values().any(|b| b.is_switchboard_pull())
+    }
+
+    pub fn mints(&self) -> impl Iterator<Item = &Pubkey> {
+        self.by_mint.keys()
+    }
+
     pub fn len(&self) -> usize {
         self.by_mint.len()
     }
@@ -293,28 +259,23 @@ impl BankRegistry {
         self.by_mint.is_empty()
     }
 
-    /// Ensure the fee-payer has an SPL Associated Token Account for
-    /// every mint in the registry. Existing ATAs are left alone; only
-    /// missing ones get created in a single batched tx (≤ ~10 ATA
-    /// creates fit comfortably in one tx).
-    ///
-    /// The ATA program's `Idempotent` instruction (variant tag = 1)
-    /// no-ops if the account already exists, so this is safe to retry
-    /// across restarts without re-burning rent.
-    ///
-    /// Note: this only CREATES the empty token accounts. For the
-    /// liquidator to actually settle loans, the debt-side ATAs must
-    /// still be funded with the debt asset (USDC etc.) — that's an
-    /// off-chain transfer the bot can't perform on the operator's
-    /// behalf.
+    /// Add new mints from `other` without overwriting cached entries.
+    pub fn merge_from(&mut self, other: BankRegistry) {
+        for (mint, info) in other.by_mint {
+            self.by_mint.entry(mint).or_insert(info);
+        }
+    }
+
+    /// Create any missing ATAs for `owner` across every known mint.
+    /// Uses the `CreateIdempotent` variant so re-runs are no-ops.
+    /// Only creates empty accounts — the operator must fund the
+    /// debt-side ATAs for the liquidator to actually settle.
     pub async fn ensure_atas_for(&self, rpc: &Rpc, fee_payer: &Keypair) -> Result<()> {
         if self.by_mint.is_empty() {
             return Ok(());
         }
         let owner = fee_payer.pubkey();
 
-        // Derive each ATA + remember the per-ATA token program so we
-        // build the correct create-ix later.
         let derived: Vec<(Pubkey, Pubkey, Pubkey)> = self
             .by_mint
             .values()
@@ -368,18 +329,8 @@ impl BankRegistry {
     }
 }
 
-/// Build the SPL Associated Token Account program's
-/// `CreateIdempotent` (tag 1) instruction. Doing this by hand instead
-/// of pulling in `spl-associated-token-account` because the entire
-/// payload is 1 byte and the account list is fixed.
-///
-/// Account order matches the upstream layout:
-///   0. [signer, writable] funding_account
-///   1. [writable]         associated_token_account (the derived PDA)
-///   2. [readonly]         wallet (the owner of the ATA)
-///   3. [readonly]         token_mint
-///   4. [readonly]         system_program
-///   5. [readonly]         token_program (legacy spl-token or token-2022)
+/// `CreateIdempotent` (tag 1) — open-coded so we don't pull in the
+/// full `spl-associated-token-account` crate for a single instruction.
 fn create_associated_token_account_idempotent_ix(
     funding: &Pubkey,
     owner: &Pubkey,
@@ -400,7 +351,6 @@ fn create_associated_token_account_idempotent_ix(
             AccountMeta::new_readonly(system_program::ID, false),
             AccountMeta::new_readonly(*token_program, false),
         ],
-        // CreateIdempotent variant tag = 1 (CreateAssociatedTokenAccount = 0)
         data: vec![1u8],
     }
 }
