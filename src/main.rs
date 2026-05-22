@@ -101,12 +101,19 @@ async fn main() -> Result<()> {
     // liquidator skips the pre-crank and logs.
     let swb_cranker = if cfg.handlers.liquidator_enabled && cfg.banks_snapshot().has_switchboard_pull()
     {
-        match swb_cranker::SwbCranker::new(
-            cfg.rpc_url.clone(),
-            ydelta::protocol::oracles::SWITCHBOARD_ON_DEMAND_PROGRAM_ID,
-            signers.fee_payer.clone(),
-        )
-        .await
+        // Switchboard On-Demand QUEUE account (mainnet default; override with
+        // SWITCHBOARD_QUEUE for devnet/custom). NOT the program id — loading
+        // the program account as a queue fails with SizeMismatch.
+        let swb_queue = std::env::var("SWITCHBOARD_QUEUE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                "A43DyUGA7s8eXPxqEjJY6EBu1KKbNgfxF8h17VAHn13w"
+                    .parse()
+                    .expect("valid mainnet switchboard queue pubkey")
+            });
+        match swb_cranker::SwbCranker::new(cfg.rpc_url.clone(), swb_queue, signers.fee_payer.clone())
+            .await
         {
             Ok(c) => {
                 tracing::info!("switchboard pull-feed cranker initialized");

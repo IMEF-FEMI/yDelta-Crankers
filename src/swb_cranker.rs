@@ -32,11 +32,15 @@ pub struct SwbCranker {
 
 impl SwbCranker {
     /// Load the Switchboard queue + the first on-chain gateway at boot.
-    pub async fn new(rpc_url: String, swb_program_id: Pubkey, payer: Arc<Keypair>) -> Result<Self> {
+    /// `swb_queue` is the Switchboard On-Demand QUEUE account pubkey (e.g.
+    /// mainnet `A43DyUGA7s8eXPxqEjJY6EBu1KKbNgfxF8h17VAHn13w`) — NOT the
+    /// program id (loading the program account parses as a queue and fails
+    /// with `SizeMismatch`).
+    pub async fn new(rpc_url: String, swb_queue: Pubkey, payer: Arc<Keypair>) -> Result<Self> {
         let rpc = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
-        let queue = QueueAccountData::load(&rpc, &swb_program_id)
+        let queue = QueueAccountData::load(&rpc, &swb_queue)
             .await
-            .map_err(|e| anyhow!("swb QueueAccountData::load: {e}"))?;
+            .map_err(|e| anyhow!("swb QueueAccountData::load({swb_queue}): {e}"))?;
         let gateway = queue
             .fetch_gateways(&rpc)
             .await
