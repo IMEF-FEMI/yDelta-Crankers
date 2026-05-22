@@ -21,8 +21,8 @@ path = "src/main.rs"
 # Pinned to a specific commit; bump when ydelta ships a change the
 # cranker needs. To update: edit the `rev` here and re-run `cargo
 # build` (Cargo.lock regenerates the relevant entries automatically).
-ydelta = { git = "https://github.com/IMEF-FEMI/yDelta.git", rev = "c00a0fa08737febd807118cf910e61f84a35289b", features = ["no-entrypoint"] }
-hypertree = { git = "https://github.com/IMEF-FEMI/yDelta.git", rev = "c00a0fa08737febd807118cf910e61f84a35289b" }
+ydelta = { git = "https://github.com/IMEF-FEMI/yDelta.git", rev = "0e1b6673f18f8bb54fdf719b2e7065e386b7a2b0", features = ["no-entrypoint"] }
+hypertree = { git = "https://github.com/IMEF-FEMI/yDelta.git", rev = "0e1b6673f18f8bb54fdf719b2e7065e386b7a2b0" }
 
 # Solana client + signing. Match ydelta's pinned 2.2.x family so the
 # Pubkey / Instruction types unify across the path boundary.

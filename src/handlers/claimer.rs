@@ -16,7 +16,6 @@ use ydelta::validation::get_lender_integration_account_address;
 
 use crate::chain_reader::{LoanView, MarketView};
 
-use super::util::now_unix;
 use super::{Handler, HandlerContext};
 
 pub struct ClaimerHandler {
@@ -49,15 +48,20 @@ impl Handler for ClaimerHandler {
             return Ok(());
         }
 
-        let t_now = now_unix();
         let markets = ctx.chain.list_markets().await?;
         let markets_by_pk: HashMap<Pubkey, &MarketView> =
             markets.iter().map(|m| (m.address, m)).collect();
 
+        // Every loan here is already `state == Repaid` (the on-chain
+        // filter in `list_repaid_vault_loans`), and the program lets the
+        // lender claim a repaid loan immediately, without waiting for
+        // maturity (see `claim_repayment_for_risk_profile`'s
+        // repaid-or-matured gate) — so there is no `matures_at_unix`
+        // filter here. Claiming promptly returns the loan PDA rent and
+        // frees the profile's deployed capital.
         let candidates: Vec<&LoanView> = loans
             .iter()
             .filter(|l| l.lender_kind == OWNER_KIND_RISK_PROFILE)
-            .filter(|l| t_now >= l.matures_at_unix)
             .collect();
 
         let mut claimed = 0;

@@ -129,21 +129,35 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Keep the Switchboard collateral oracle(s) fresh on-chain on a cadence
-    // (default 20s, SWITCHBOARD_CRANK_INTERVAL_SEC). Pull feeds aren't pushed
-    // unless cranked, and marginfi's read gate rejects a stale feed — so this
-    // keeps it warm for ALL readers: borrow / withdraw / liquidation and the
-    // UI (which no longer self-cranks). Same gateway crank the liquidator's
-    // pre-crank uses, just on a loop.
-    let _swb_crank_task = swb_cranker.as_ref().map(|c| {
-        let interval = std::time::Duration::from_secs(
-            std::env::var("SWITCHBOARD_CRANK_INTERVAL_SEC")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(20),
-        );
-        swb_cranker::spawn_swb_crank_loop(Arc::clone(c), cfg.clone(), stop.clone(), interval)
-    });
+    // Optional continuous Switchboard warm-keeper — DEFAULT OFF.
+    //
+    // It posts a Switchboard On-Demand update on a fixed cadence to keep
+    // the pull feed warm on-chain. But each consensus update carries a
+    // per-update oracle charge (~0.0026 SOL — far more than the tx fee),
+    // so on a 20s cadence it drains the fee payer by ~0.5 SOL/day. And it
+    // is redundant: every consumer that reads the feed (the UI, the TS
+    // scripts, and the liquidator's own pre-crank below) already BUNDLES
+    // a fresh `fetchUpdateIx` into its consuming tx, so freshness is paid
+    // for per-use by whoever needs it. Leaving this loop on just pre-pays
+    // for freshness nobody depends on.
+    //
+    // Set SWITCHBOARD_WARMKEEPER=true to re-enable (e.g. for readers that
+    // can't bundle); it then runs at a fixed 60s cadence.
+    let warmkeeper_enabled = std::env::var("SWITCHBOARD_WARMKEEPER")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    let _swb_crank_task = swb_cranker
+        .as_ref()
+        .filter(|_| warmkeeper_enabled)
+        .map(|c| {
+            // Fixed 60s cadence when explicitly opted in — this is an
+            // escape hatch, not a tuning surface, so no env knob. Even at
+            // 60s the per-update oracle charge adds up (~0.15 SOL/day),
+            // so only enable it for a reader that genuinely can't bundle.
+            let interval = std::time::Duration::from_secs(60);
+            tracing::info!("switchboard warm-keeper ENABLED (60s cadence)");
+            swb_cranker::spawn_swb_crank_loop(Arc::clone(c), cfg.clone(), stop.clone(), interval)
+        });
 
     let fee_payer_low = Arc::new(AtomicBool::new(false));
     let ata_balances = Arc::new(RwLock::new(HashMap::new()));

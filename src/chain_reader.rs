@@ -1,5 +1,5 @@
 //! `getProgramAccounts` + in-place hypertree walks against the yDelta
-//! program. No indexer.
+//! program — all protocol state is read directly from chain.
 
 #![allow(dead_code)]
 

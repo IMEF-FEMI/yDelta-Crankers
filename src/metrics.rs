@@ -20,16 +20,12 @@ pub const FAIL_REASON_RPC: &str = "rpc_error";
 pub const FAIL_REASON_INSUFFICIENT_FUNDS: &str = "insufficient_funds";
 pub const FAIL_REASON_SIM_FAILED: &str = "sim_failed";
 pub const FAIL_REASON_TX_REJECTED: &str = "tx_rejected";
-pub const FAIL_REASON_INDEXER: &str = "indexer_error";
 pub const FAIL_REASON_DECODE: &str = "decode_error";
 pub const FAIL_REASON_INTERNAL: &str = "internal";
 
 pub fn classify_handler_error(err: &anyhow::Error) -> &'static str {
     let msg = format!("{err:#}").to_lowercase();
-    if msg.contains("indexer") || msg.contains("reqwest") || msg.contains("http") {
-        FAIL_REASON_INDEXER
-    } else if msg.contains("insufficient") || msg.contains("lamports") || msg.contains("not enough")
-    {
+    if msg.contains("insufficient") || msg.contains("lamports") || msg.contains("not enough") {
         FAIL_REASON_INSUFFICIENT_FUNDS
     } else if msg.contains("simulation") || msg.contains("simulate") {
         FAIL_REASON_SIM_FAILED
@@ -38,7 +34,13 @@ pub fn classify_handler_error(err: &anyhow::Error) -> &'static str {
         || msg.contains("tx_rejected")
     {
         FAIL_REASON_TX_REJECTED
-    } else if msg.contains("rpc") || msg.contains("connection") || msg.contains("timed out") {
+    } else if msg.contains("rpc")
+        || msg.contains("connection")
+        || msg.contains("timed out")
+        || msg.contains("reqwest")
+        || msg.contains("http")
+    {
+        // Network/transport-layer failures (the RPC client uses reqwest/http).
         FAIL_REASON_RPC
     } else if msg.contains("decode") || msg.contains("deserialize") || msg.contains("bytemuck") {
         FAIL_REASON_DECODE
