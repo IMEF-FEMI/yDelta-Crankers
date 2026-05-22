@@ -247,6 +247,20 @@ impl BankRegistry {
         self.by_mint.values().any(|b| b.is_switchboard_pull())
     }
 
+    /// Primary oracle of every SwitchboardPull bank — the feeds the periodic
+    /// cranker must keep fresh on-chain (deduped).
+    pub fn switchboard_pull_oracles(&self) -> Vec<Pubkey> {
+        let mut out: Vec<Pubkey> = self
+            .by_mint
+            .values()
+            .filter(|b| b.is_switchboard_pull())
+            .map(|b| b.primary_oracle())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
     pub fn mints(&self) -> impl Iterator<Item = &Pubkey> {
         self.by_mint.keys()
     }

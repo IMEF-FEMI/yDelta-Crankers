@@ -8,7 +8,9 @@
 //! inside the freshness window). Mirrors `references/eva01`'s `SwbCranker`,
 //! using the first on-chain gateway (no crossbar).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use solana_client::nonblocking::rpc_client::RpcClient;
@@ -26,12 +28,14 @@ use switchboard_on_demand_client::{
 
 pub struct SwbCranker {
     rpc: RpcClient,
-    gateway: Gateway,
+    /// ALL on-chain gateways for the queue, tried in order with failover —
+    /// one throttled/dead gateway must not stall cranking.
+    gateways: Vec<Gateway>,
     payer: Arc<Keypair>,
 }
 
 impl SwbCranker {
-    /// Load the Switchboard queue + the first on-chain gateway at boot.
+    /// Load the Switchboard queue + ALL on-chain gateways at boot.
     /// `swb_queue` is the Switchboard On-Demand QUEUE account pubkey (e.g.
     /// mainnet `A43DyUGA7s8eXPxqEjJY6EBu1KKbNgfxF8h17VAHn13w`) — NOT the
     /// program id (loading the program account parses as a queue and fails
@@ -41,34 +45,56 @@ impl SwbCranker {
         let queue = QueueAccountData::load(&rpc, &swb_queue)
             .await
             .map_err(|e| anyhow!("swb QueueAccountData::load({swb_queue}): {e}"))?;
-        let gateway = queue
+        let gateways = queue
             .fetch_gateways(&rpc)
             .await
-            .map_err(|e| anyhow!("swb fetch_gateways: {e}"))?
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("no on-chain switchboard gateways"))?;
+            .map_err(|e| anyhow!("swb fetch_gateways: {e}"))?;
+        if gateways.is_empty() {
+            return Err(anyhow!("no on-chain switchboard gateways"));
+        }
+        tracing::info!(gateways = gateways.len(), "swb cranker loaded gateways");
 
         Ok(Self {
             rpc,
-            gateway,
+            gateways,
             payer,
         })
     }
 
     /// Post a fresh consensus update for `oracles` in one tx, signed by the
-    /// fee payer. No-op on an empty slice.
+    /// fee payer. No-op on an empty slice. Tries each gateway in turn so a
+    /// single throttled/stale gateway (HTTP 500 / rate-limit) doesn't fail
+    /// the crank — mirrors the UI's `/api/oracle-update` failover.
     pub async fn crank(&self, oracles: Vec<Pubkey>) -> Result<Option<Signature>> {
         if oracles.is_empty() {
             return Ok(None);
         }
+        let mut last_err: Option<anyhow::Error> = None;
+        for (i, gateway) in self.gateways.iter().enumerate() {
+            match self.try_crank(&oracles, gateway).await {
+                Ok(sig) => return Ok(Some(sig)),
+                Err(e) => {
+                    tracing::debug!(gateway_idx = i, error = %e, "swb gateway failed; trying next");
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(anyhow!(
+            "all {} switchboard gateways failed: {}",
+            self.gateways.len(),
+            last_err.map(|e| e.to_string()).unwrap_or_default()
+        ))
+    }
+
+    /// One crank attempt against a single gateway.
+    async fn try_crank(&self, oracles: &[Pubkey], gateway: &Gateway) -> Result<Signature> {
         let (ixs, luts) = PullFeed::fetch_update_consensus_ix(
             SbContext::new(),
             &self.rpc,
             FetchUpdateManyParams {
-                feeds: oracles,
+                feeds: oracles.to_vec(),
                 payer: self.payer.pubkey(),
-                gateway: self.gateway.clone(),
+                gateway: gateway.clone(),
                 crossbar: None,
                 num_signatures: Some(1),
                 ..Default::default()
@@ -86,6 +112,48 @@ impl SwbCranker {
         )?);
         let tx = VersionedTransaction::try_new(msg, &[self.payer.as_ref()])?;
         let sig = self.rpc.send_and_confirm_transaction(&tx).await?;
-        Ok(Some(sig))
+        Ok(sig)
     }
+}
+
+/// Periodically crank every SwitchboardPull collateral oracle so the
+/// on-chain feed stays inside marginfi's `oracle_max_age`. Pull feeds are
+/// only posted when someone cranks them; this keeps them warm for ALL
+/// readers — borrow / withdraw / liquidation, and the UI (which no longer
+/// self-cranks) — the same way other protocols on the bank do. Uses the
+/// gateway path (no crossbar). Re-reads the bank snapshot each tick so a
+/// newly-added Switchboard market is picked up automatically.
+pub fn spawn_swb_crank_loop(
+    cranker: Arc<SwbCranker>,
+    cfg: Arc<crate::config::Config>,
+    stop: Arc<AtomicBool>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            let oracles = cfg.banks_snapshot().switchboard_pull_oracles();
+            if !oracles.is_empty() {
+                match cranker.crank(oracles).await {
+                    Ok(Some(sig)) => tracing::debug!(%sig, "swb periodic crank posted"),
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "swb periodic crank failed; feed may go stale")
+                    }
+                }
+            }
+            // Stop-aware sleep so shutdown isn't blocked for a full interval.
+            let mut elapsed = Duration::ZERO;
+            let step = Duration::from_millis(500);
+            while elapsed < interval {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                tokio::time::sleep(step).await;
+                elapsed += step;
+            }
+        }
+    })
 }

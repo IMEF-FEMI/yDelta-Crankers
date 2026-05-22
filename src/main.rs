@@ -95,12 +95,13 @@ async fn main() -> Result<()> {
         stop_signal.store(true, std::sync::atomic::Ordering::Relaxed);
     });
 
-    // Switchboard pull-feed cranker — only when a Switchboard-collateral
-    // market exists and the liquidator is enabled (it loads the swb queue +
-    // gateway from chain at boot). A boot failure is non-fatal: the
-    // liquidator skips the pre-crank and logs.
-    let swb_cranker = if cfg.handlers.liquidator_enabled && cfg.banks_snapshot().has_switchboard_pull()
-    {
+    // Switchboard pull-feed cranker — booted whenever a Switchboard-collateral
+    // market exists (it loads the swb queue + gateway from chain at boot).
+    // Used BOTH by the periodic crank loop below (keeps the feed fresh for
+    // borrow/withdraw/UI) AND the liquidator's pre-crank — so it's NOT gated
+    // on the liquidator being enabled. A boot failure is non-fatal: callers
+    // skip and log.
+    let swb_cranker = if cfg.banks_snapshot().has_switchboard_pull() {
         // Switchboard On-Demand QUEUE account (mainnet default; override with
         // SWITCHBOARD_QUEUE for devnet/custom). NOT the program id — loading
         // the program account as a queue fails with SizeMismatch.
@@ -127,6 +128,22 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+
+    // Keep the Switchboard collateral oracle(s) fresh on-chain on a cadence
+    // (default 20s, SWITCHBOARD_CRANK_INTERVAL_SEC). Pull feeds aren't pushed
+    // unless cranked, and marginfi's read gate rejects a stale feed — so this
+    // keeps it warm for ALL readers: borrow / withdraw / liquidation and the
+    // UI (which no longer self-cranks). Same gateway crank the liquidator's
+    // pre-crank uses, just on a loop.
+    let _swb_crank_task = swb_cranker.as_ref().map(|c| {
+        let interval = std::time::Duration::from_secs(
+            std::env::var("SWITCHBOARD_CRANK_INTERVAL_SEC")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(20),
+        );
+        swb_cranker::spawn_swb_crank_loop(Arc::clone(c), cfg.clone(), stop.clone(), interval)
+    });
 
     let fee_payer_low = Arc::new(AtomicBool::new(false));
     let ata_balances = Arc::new(RwLock::new(HashMap::new()));
