@@ -6,7 +6,7 @@ use std::{collections::HashSet, sync::Mutex};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use solana_program::pubkey::Pubkey;
-use solana_sdk::signature::Signer as _;
+use solana_sdk::{address_lookup_table::AddressLookupTableAccount, instruction::Instruction, signature::Signer as _};
 use ydelta::program::instruction_builders::{
     check_ltv_liquidatable_instruction, check_maturity_liquidatable_instruction,
     liquidate_loan_instruction, settle_matured_loan_instruction,
@@ -126,34 +126,43 @@ impl LiquidatorHandler {
         self.inflight.lock().unwrap().remove(&loan);
     }
 
-    /// Post a fresh Switchboard update for the collateral feed before the
-    /// LTV/maturity sim + settle/liquidate ix read it. Switchboard On-Demand
-    /// is pull-based; without this the on-chain staleness gate rejects and
-    /// the loan can never be settled/liquidated. No-op for Pyth-Push
-    /// collateral (Pyth-DA keeps that fresh) or when no cranker is configured;
-    /// a crank failure is non-fatal (the downstream sim still gates).
-    async fn refresh_collateral_oracle(
+    /// Build (don't submit) the Switchboard fetch-update bundle for the
+    /// collateral feed, so callers can BUNDLE it into both the sim AND
+    /// the real submission. Sim runs both in the RPC sandbox — the SWB
+    /// update lands in-memory before the consuming check reads the price,
+    /// so the sim sees a fresh oracle but pays zero SOL. We only spend
+    /// SOL when the consuming check passes and we submit the real tx.
+    ///
+    /// Returns `(vec![], vec![])` for Pyth-Push collateral (Pyth-DA keeps
+    /// that fresh) or when no SWB cranker is configured, so callers can
+    /// treat the result as a uniform "prepend these to your ixs/luts".
+    /// A gateway failure is non-fatal: the caller proceeds with an empty
+    /// bundle and the on-chain staleness gate decides whether to reject.
+    async fn fetch_swb_bundle(
         &self,
         ctx: &HandlerContext,
         collateral_bank: &crate::bank_registry::BankInfo,
         loan: &LoanView,
-    ) {
+    ) -> (Vec<Instruction>, Vec<AddressLookupTableAccount>) {
         if !collateral_bank.is_switchboard_pull() {
-            return;
+            return (vec![], vec![]);
         }
         let Some(cranker) = ctx.swb_cranker.as_ref() else {
-            return;
+            return (vec![], vec![]);
         };
-        match cranker.crank(vec![collateral_bank.primary_oracle()]).await {
-            Ok(Some(sig)) => {
-                tracing::debug!(loan = %loan.address, %sig, "cranked switchboard collateral oracle")
+        match cranker
+            .fetch_update_ixs(vec![collateral_bank.primary_oracle()])
+            .await
+        {
+            Ok(bundle) => bundle,
+            Err(e) => {
+                tracing::warn!(
+                    loan = %loan.address,
+                    error = %e,
+                    "switchboard gateway fetch failed; proceeding without prepend (sim will gate)"
+                );
+                (vec![], vec![])
             }
-            Ok(None) => {}
-            Err(e) => tracing::warn!(
-                loan = %loan.address,
-                error = %e,
-                "switchboard collateral crank failed; proceeding (sim will gate)"
-            ),
         }
     }
 
@@ -202,9 +211,12 @@ impl LiquidatorHandler {
         let fee_payer = ctx.signers.fee_payer.clone();
         let payer_pk = fee_payer.pubkey();
 
-        // The maturity sim reads only the debt feed, but the settle ix below
-        // reads the collateral (Switchboard) feed too — refresh it up front.
-        self.refresh_collateral_oracle(ctx, &collateral_bank, loan).await;
+        // The settle ix reads the collateral (Switchboard) feed, so bundle
+        // a fresh SWB update in front of BOTH the sim and the real submit.
+        // The sim runs the update in-memory (free), so a healthy loan that
+        // fails the sim costs us zero SOL — the old flow paid for the SWB
+        // update unconditionally before this point.
+        let (swb_ixs, swb_luts) = self.fetch_swb_bundle(ctx, &collateral_bank, loan).await;
 
         let sim_ix = check_maturity_liquidatable_instruction(
             &market_pk,
@@ -213,7 +225,9 @@ impl LiquidatorHandler {
             &debt_bank.bank,
             &ctx.cfg.marginfi_program_id,
         );
-        let sim = ctx.rpc.simulate(vec![sim_ix], &payer_pk).await?;
+        let mut sim_bundle = swb_ixs.clone();
+        sim_bundle.push(sim_ix);
+        let sim = ctx.rpc.simulate_v0(sim_bundle, &swb_luts, &payer_pk).await?;
         if !sim.ok {
             tracing::debug!(loan = %loan.address, error = ?sim.error, "maturity sim failed");
             return Ok(false);
@@ -251,9 +265,15 @@ impl LiquidatorHandler {
             &payer_pk,
         );
 
+        // Same SWB prepend as the sim — the real on-chain landing needs
+        // the update too, or the staleness gate inside the settle ix will
+        // reject. This is the ONLY place SOL gets spent for the SWB
+        // update, and it only fires when sim already said yes.
+        let mut real_bundle = swb_ixs;
+        real_bundle.push(ix);
         let sig = ctx
             .rpc
-            .send_signed_labeled("settle_matured_loan", vec![ix], &[&fee_payer])
+            .send_signed_v0_labeled("settle_matured_loan", real_bundle, &swb_luts, &[&fee_payer])
             .await?;
         tracing::info!(
             loan = %loan.address,
@@ -284,9 +304,11 @@ impl LiquidatorHandler {
         let fee_payer = ctx.signers.fee_payer.clone();
         let payer_pk = fee_payer.pubkey();
 
-        // The LTV sim AND the liquidate ix read the collateral (Switchboard)
-        // feed — refresh it so the staleness gate doesn't reject.
-        self.refresh_collateral_oracle(ctx, &collateral_bank, loan).await;
+        // Bundle a fresh SWB update in front of the LTV sim AND the real
+        // liquidate ix. The sim runs both in-memory for free, so a loan
+        // whose LTV sim fails costs zero SOL. We only spend on the SWB
+        // update when sim says yes and we actually submit.
+        let (swb_ixs, swb_luts) = self.fetch_swb_bundle(ctx, &collateral_bank, loan).await;
 
         let sim_ix = check_ltv_liquidatable_instruction(
             &market_pk,
@@ -298,7 +320,9 @@ impl LiquidatorHandler {
             &collateral_bank.oracles,
             &ctx.cfg.marginfi_program_id,
         );
-        let sim = ctx.rpc.simulate(vec![sim_ix], &payer_pk).await?;
+        let mut sim_bundle = swb_ixs.clone();
+        sim_bundle.push(sim_ix);
+        let sim = ctx.rpc.simulate_v0(sim_bundle, &swb_luts, &payer_pk).await?;
         if !sim.ok {
             tracing::debug!(loan = %loan.address, error = ?sim.error, "ltv sim failed");
             return Ok(false);
@@ -352,9 +376,13 @@ impl LiquidatorHandler {
             &payer_pk,
         );
 
+        // Same SWB prepend as the sim — pays SOL only here, when the
+        // sim already confirmed the loan is liquidatable.
+        let mut real_bundle = swb_ixs;
+        real_bundle.push(ix);
         let sig = ctx
             .rpc
-            .send_signed_labeled("liquidate_loan", vec![ix], &[&fee_payer])
+            .send_signed_v0_labeled("liquidate_loan", real_bundle, &swb_luts, &[&fee_payer])
             .await?;
         tracing::info!(
             loan = %loan.address,

@@ -16,7 +16,9 @@ use anyhow::{anyhow, Result};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_program::pubkey::Pubkey;
 use solana_sdk::{
+    address_lookup_table::AddressLookupTableAccount,
     commitment_config::CommitmentConfig,
+    instruction::Instruction,
     message::{v0, VersionedMessage},
     signature::{Keypair, Signature},
     signer::Signer,
@@ -88,7 +90,57 @@ impl SwbCranker {
 
     /// One crank attempt against a single gateway.
     async fn try_crank(&self, oracles: &[Pubkey], gateway: &Gateway) -> Result<Signature> {
-        let (ixs, luts) = PullFeed::fetch_update_consensus_ix(
+        let (ixs, luts) = self.fetch_update_via(oracles, gateway).await?;
+        let blockhash = self.rpc.get_latest_blockhash().await?;
+        let msg = VersionedMessage::V0(v0::Message::try_compile(
+            &self.payer.pubkey(),
+            &ixs,
+            &luts,
+            blockhash,
+        )?);
+        let tx = VersionedTransaction::try_new(msg, &[self.payer.as_ref()])?;
+        let sig = self.rpc.send_and_confirm_transaction(&tx).await?;
+        Ok(sig)
+    }
+
+    /// Build (without submitting) the fetch-update ix bundle for `oracles`.
+    /// Used by callers (the liquidator) that want to BUNDLE the SWB update
+    /// with their consuming ix into a single sim/tx — sim pays no SOL, and
+    /// the real submission only happens when the consuming ix's gate passes.
+    /// Tries each gateway in turn so a flaky one doesn't kill the fetch.
+    pub async fn fetch_update_ixs(
+        &self,
+        oracles: Vec<Pubkey>,
+    ) -> Result<(Vec<Instruction>, Vec<AddressLookupTableAccount>)> {
+        if oracles.is_empty() {
+            return Ok((vec![], vec![]));
+        }
+        let mut last_err: Option<anyhow::Error> = None;
+        for (i, gateway) in self.gateways.iter().enumerate() {
+            match self.fetch_update_via(&oracles, gateway).await {
+                Ok(bundle) => return Ok(bundle),
+                Err(e) => {
+                    tracing::debug!(gateway_idx = i, error = %e, "swb gateway failed; trying next");
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(anyhow!(
+            "all {} switchboard gateways failed: {}",
+            self.gateways.len(),
+            last_err.map(|e| e.to_string()).unwrap_or_default()
+        ))
+    }
+
+    /// Pure HTTP gateway call — no on-chain side effect, no SOL cost. The
+    /// returned ixs include a Secp256k1 verify + the on-demand update ix;
+    /// LUTs compress the account list to fit the 1232-byte tx limit.
+    async fn fetch_update_via(
+        &self,
+        oracles: &[Pubkey],
+        gateway: &Gateway,
+    ) -> Result<(Vec<Instruction>, Vec<AddressLookupTableAccount>)> {
+        PullFeed::fetch_update_consensus_ix(
             SbContext::new(),
             &self.rpc,
             FetchUpdateManyParams {
@@ -101,18 +153,7 @@ impl SwbCranker {
             },
         )
         .await
-        .map_err(|e| anyhow!("swb fetch_update_consensus_ix: {e}"))?;
-
-        let blockhash = self.rpc.get_latest_blockhash().await?;
-        let msg = VersionedMessage::V0(v0::Message::try_compile(
-            &self.payer.pubkey(),
-            &ixs,
-            &luts,
-            blockhash,
-        )?);
-        let tx = VersionedTransaction::try_new(msg, &[self.payer.as_ref()])?;
-        let sig = self.rpc.send_and_confirm_transaction(&tx).await?;
-        Ok(sig)
+        .map_err(|e| anyhow!("swb fetch_update_consensus_ix: {e}"))
     }
 }
 
