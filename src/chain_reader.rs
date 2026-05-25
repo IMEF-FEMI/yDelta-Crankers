@@ -18,11 +18,12 @@ use solana_sdk::commitment_config::CommitmentConfig;
 
 use ydelta::state::loan::{LoanFixed, LoanState, LOAN_FIXED_DISCRIMINANT, LOAN_FIXED_SIZE};
 use ydelta::state::market::{
-    BooksideReadOnly, MarketFixed, MatchedLoan, MatchedLoanTreeReadOnly,
+    BooksideReadOnly, ClaimedSeatTreeReadOnly, MarketFixed, MatchedLoan, MatchedLoanTreeReadOnly,
     MATCHED_LOAN_FLAG_VAULT_LENDER, MATCHED_LOAN_FLAG_VAULT_PRESETTLED,
 };
 use ydelta::state::resting_order::RestingOrder;
 use ydelta::state::vault::{GlobalVaultFixed, RiskProfile, RiskProfileTreeReadOnly};
+use ydelta::state::ClaimedSeat;
 use ydelta::state::{
     GLOBAL_VAULT_FIXED_DISCRIMINANT, GLOBAL_VAULT_FIXED_SIZE, MARKET_FIXED_DISCRIMINANT,
     MARKET_FIXED_SIZE, OWNER_KIND_RISK_PROFILE,
@@ -144,6 +145,29 @@ pub struct RiskProfileView {
     pub curator: Pubkey,
     pub accumulated_curator_fee_atoms: u64,
     pub vault_is_paused: bool,
+    /// Atoms retired by repay/liquidation/settle but not yet swept by
+    /// `claim_repayment_for_risk_profile`. Sum across all markets the
+    /// profile has been lending on; surfaced for cranker triage but the
+    /// authoritative per-market source is the ClaimedSeat tree (see
+    /// `PendingVaultClaim`).
+    pub pending_claim_atoms: u64,
+    /// `true` when `profile.is_sunset == 1`. Sunset profiles still need
+    /// claim sweeps and curator-fee claims; they only block deposits,
+    /// new orders, order updates, and matches.
+    pub is_sunset: bool,
+}
+
+/// A (market, vault, profile_id) triple with unsettled
+/// `debt_withdrawable_shares` on the vault-owned `ClaimedSeat`. One row
+/// per `claim_repayment_for_risk_profile` call the cranker should issue.
+#[derive(Debug, Clone)]
+pub struct PendingVaultClaim {
+    pub market: Pubkey,
+    pub debt_mint: Pubkey,
+    pub debt_bank: Pubkey,
+    pub lender_global_vault: Pubkey,
+    pub risk_profile_id: u8,
+    pub debt_withdrawable_shares: u128,
 }
 
 #[derive(Clone)]
@@ -415,6 +439,60 @@ impl ChainReader {
                     curator: profile.curator,
                     accumulated_curator_fee_atoms: profile.accumulated_curator_fee_atoms,
                     vault_is_paused: header.is_paused != 0,
+                    pending_claim_atoms: profile.pending_claim_atoms,
+                    is_sunset: profile.is_sunset != 0,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Walks every market's ClaimedSeat tree and returns one row per
+    /// vault-owned seat with `debt_withdrawable_shares > 0` — the set of
+    /// `(market, vault, profile_id)` triples the claimer should sweep.
+    ///
+    /// The on-chain processor reads shares (not atoms) off the seat, so
+    /// this is the authoritative trigger: a non-zero share count is the
+    /// only signal that a sweep will move atoms. `RiskProfile.pending_claim_atoms`
+    /// is consistent with the sum of these shares' atom value but isn't
+    /// keyed per-market, so it can't drive the per-(profile, market)
+    /// ix selection on its own.
+    pub async fn list_pending_vault_claims(
+        &self,
+        markets: &[MarketView],
+    ) -> Result<Vec<PendingVaultClaim>> {
+        let mut out = Vec::new();
+        for market in markets {
+            if market.is_paused {
+                continue;
+            }
+            let data = match self.rpc.get_account_data(&market.address).await? {
+                Some(d) => d,
+                None => continue,
+            };
+            let (fixed, dynamic) = match split_market(&data) {
+                Ok(parts) => parts,
+                Err(_) => continue,
+            };
+            if fixed.claimed_seats_root_index == NIL {
+                continue;
+            }
+            let tree =
+                ClaimedSeatTreeReadOnly::new(dynamic, fixed.claimed_seats_root_index, NIL);
+            for (_idx, seat) in tree.iter::<ClaimedSeat>() {
+                if seat.owner_kind != OWNER_KIND_RISK_PROFILE {
+                    continue;
+                }
+                if seat.debt_withdrawable_shares == 0 {
+                    continue;
+                }
+                out.push(PendingVaultClaim {
+                    market: market.address,
+                    debt_mint: market.debt_mint,
+                    debt_bank: market.debt_bank,
+                    lender_global_vault: seat.owner,
+                    risk_profile_id: seat.risk_profile_id,
+                    debt_withdrawable_shares: seat.debt_withdrawable_shares,
                 });
             }
         }

@@ -243,6 +243,15 @@ impl LiquidatorHandler {
             None => return Ok(false),
         };
 
+        // Fixed loans need the lender vault passed through so the full-settle
+        // close-out can decrement the risk profile + bump pending_claim_atoms.
+        // P2Pool loans have no vault lender — must be None or the loader rejects.
+        let settle_global_vault: Option<&Pubkey> = if loan.is_p2pool() {
+            None
+        } else {
+            Some(&loan.lender_global_vault)
+        };
+
         let ix = settle_matured_loan_instruction(
             &market_pk,
             &payer_pk,
@@ -263,6 +272,7 @@ impl LiquidatorHandler {
             &ctx.cfg.marginfi_program_id,
             repay_atoms_max,
             &payer_pk,
+            settle_global_vault,
         );
 
         // Same SWB prepend as the sim — the real on-chain landing needs
@@ -354,6 +364,15 @@ impl LiquidatorHandler {
             None => return Ok(false),
         };
 
+        // Fixed loans need the lender vault passed through so the full-liquidate
+        // close-out can decrement the risk profile + bump pending_claim_atoms.
+        // P2Pool loans have no vault lender — must be None or the loader rejects.
+        let liquidate_global_vault: Option<&Pubkey> = if loan.is_p2pool() {
+            None
+        } else {
+            Some(&loan.lender_global_vault)
+        };
+
         let ix = liquidate_loan_instruction(
             &market_pk,
             &payer_pk,
@@ -374,6 +393,7 @@ impl LiquidatorHandler {
             &ctx.cfg.marginfi_program_id,
             repay_atoms_max,
             &payer_pk,
+            liquidate_global_vault,
         );
 
         // Same SWB prepend as the sim — pays SOL only here, when the
