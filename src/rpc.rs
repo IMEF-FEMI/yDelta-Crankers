@@ -19,17 +19,30 @@ use solana_sdk::{
     transaction::{Transaction, VersionedTransaction},
 };
 
+/// CU limit for the heavier v0 path (liquidator SWB-bundle + marginfi-CPI
+/// settle/liquidate txs). Kept at Solana's per-tx ceiling so a valuable
+/// liquidation can never be truncated — these txs are rare, so the larger
+/// priority fee they imply is not a meaningful cost.
+const V0_COMPUTE_UNIT_LIMIT: u32 = 1_400_000;
+
 #[derive(Clone)]
 pub struct Rpc {
     client: Arc<RpcClient>,
     priority_fee_micro_lamports: u64,
+    /// CU limit requested on the routine (legacy-message) send path —
+    /// promoter / claimer txs. The prioritization fee is charged as
+    /// `compute_unit_price × compute_unit_limit` (the REQUESTED limit, not
+    /// the units actually consumed), so an oversized limit silently
+    /// overpays every tx. Sized to comfortably cover observed usage
+    /// (~130–170k CU) with headroom; tune via `COMPUTE_UNIT_LIMIT`.
+    compute_unit_limit: u32,
     /// When set, `send_with_retry` bails between attempts. We never
     /// cancel an in-flight `send_and_confirm` — the tx might land.
     stop: Option<Arc<AtomicBool>>,
 }
 
 impl Rpc {
-    pub fn new(url: String, priority_fee_micro_lamports: u64) -> Self {
+    pub fn new(url: String, priority_fee_micro_lamports: u64, compute_unit_limit: u32) -> Self {
         let client = Arc::new(RpcClient::new_with_commitment(
             url,
             CommitmentConfig::confirmed(),
@@ -37,6 +50,7 @@ impl Rpc {
         Self {
             client,
             priority_fee_micro_lamports,
+            compute_unit_limit,
             stop: None,
         }
     }
@@ -138,7 +152,7 @@ impl Rpc {
         }
         let fee_payer = signers[0];
 
-        let mut all_ixs = self.priority_fee_preamble();
+        let mut all_ixs = self.priority_fee_preamble(self.compute_unit_limit);
         all_ixs.extend(ixs);
 
         let t0 = std::time::Instant::now();
@@ -269,6 +283,7 @@ impl Rpc {
         Ok(SimulationResult {
             ok: result.value.err.is_none(),
             error: result.value.err.map(|e| format!("{e:?}")),
+            logs: result.value.logs.unwrap_or_default(),
         })
     }
 
@@ -287,7 +302,7 @@ impl Rpc {
         }
         let fee_payer = signers[0];
 
-        let mut all_ixs = self.priority_fee_preamble();
+        let mut all_ixs = self.priority_fee_preamble(V0_COMPUTE_UNIT_LIMIT);
         all_ixs.extend(ixs);
 
         let t0 = std::time::Instant::now();
@@ -362,11 +377,14 @@ impl Rpc {
         unreachable!()
     }
 
-    /// CU limit set to 1.4M (Solana's per-tx ceiling). The limit is a
-    /// cap, not a charge — only consumed CU is billed — so this just
-    /// guards against truncation on marginfi-CPI-heavy txs.
-    fn priority_fee_preamble(&self) -> Vec<Instruction> {
-        let mut ixs = vec![ComputeBudgetInstruction::set_compute_unit_limit(1_400_000)];
+    /// Build the compute-budget preamble. NOTE: the prioritization fee is
+    /// `compute_unit_price × compute_unit_limit` using the REQUESTED limit,
+    /// not the units actually consumed — so `cu_limit` is a direct cost
+    /// lever, not just a truncation guard. Callers pass a limit sized to the
+    /// path: the routine `compute_unit_limit` for promoter/claimer txs, the
+    /// larger `V0_COMPUTE_UNIT_LIMIT` for the liquidator's CPI-heavy bundles.
+    fn priority_fee_preamble(&self, cu_limit: u32) -> Vec<Instruction> {
+        let mut ixs = vec![ComputeBudgetInstruction::set_compute_unit_limit(cu_limit)];
         if self.priority_fee_micro_lamports > 0 {
             ixs.push(ComputeBudgetInstruction::set_compute_unit_price(
                 self.priority_fee_micro_lamports,
@@ -380,6 +398,12 @@ impl Rpc {
 pub struct SimulationResult {
     pub ok: bool,
     pub error: Option<String>,
+    /// Program logs from the sandbox run, including `sol_log_data`
+    /// (`Program data: <base64>`) lines. Lets a caller gate on the
+    /// *productive* signal a tx emits (e.g. `MatchCrankLog.fills`), not
+    /// just whether it reverted — a 0-work tx that still succeeds would
+    /// otherwise pass `ok` and land for nothing.
+    pub logs: Vec<String>,
 }
 
 /// Classify safe-to-retry vs definitive errors. We match on the

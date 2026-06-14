@@ -10,7 +10,7 @@ use ydelta_crankers::chain_reader::ChainReader;
 use ydelta_crankers::config::{redact_url, Config};
 use ydelta_crankers::handlers::{
     spawn, ClaimerHandler, CuratorFeeClaimerHandler, HandlerContext, LiquidatorHandler,
-    PromoterHandler,
+    MatchCrankerHandler, PromoterHandler,
 };
 use ydelta_crankers::rpc::Rpc;
 use ydelta_crankers::signer::Signers;
@@ -34,8 +34,12 @@ async fn main() -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
 
     let signers = Signers::load(&cfg)?;
-    let rpc = Rpc::new(cfg.rpc_url.clone(), cfg.priority_fee_micro_lamports)
-        .with_stop_signal(stop.clone());
+    let rpc = Rpc::new(
+        cfg.rpc_url.clone(),
+        cfg.priority_fee_micro_lamports,
+        cfg.compute_unit_limit,
+    )
+    .with_stop_signal(stop.clone());
     let chain = ChainReader::new(rpc.clone(), cfg.program_id);
 
     cfg.discover_banks_from_markets(&rpc, &chain)
@@ -224,6 +228,13 @@ async fn main() -> Result<()> {
             Arc::new(CuratorFeeClaimerHandler::new()),
             ctx.clone(),
             cfg.handlers.curator_fee_claimer_interval,
+        ));
+    }
+    if cfg.handlers.match_cranker_enabled {
+        handles.push(spawn(
+            Arc::new(MatchCrankerHandler::new()),
+            ctx.clone(),
+            cfg.handlers.match_cranker_interval,
         ));
     }
 

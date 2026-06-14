@@ -22,11 +22,11 @@ use ydelta::state::market::{
     MATCHED_LOAN_FLAG_VAULT_LENDER, MATCHED_LOAN_FLAG_VAULT_PRESETTLED,
 };
 use ydelta::state::resting_order::RestingOrder;
-use ydelta::state::vault::{GlobalVaultFixed, RiskProfile, RiskProfileTreeReadOnly};
+use ydelta::state::vault::{GlobalVaultFixed, SubVault, SubVaultTreeReadOnly};
 use ydelta::state::ClaimedSeat;
 use ydelta::state::{
     GLOBAL_VAULT_FIXED_DISCRIMINANT, GLOBAL_VAULT_FIXED_SIZE, MARKET_FIXED_DISCRIMINANT,
-    MARKET_FIXED_SIZE, OWNER_KIND_RISK_PROFILE,
+    MARKET_FIXED_SIZE, OWNER_KIND_SUB_VAULT,
 };
 
 use crate::rpc::Rpc;
@@ -39,7 +39,7 @@ mod loan_offsets {
     pub const STATE: usize = 196;
     pub const LOAN_TYPE: usize = 197;
     pub const LENDER_KIND: usize = 201;
-    pub const LENDER_PROFILE_ID: usize = 202;
+    pub const LENDER_SUB_VAULT_ID: usize = 202;
     pub const LENDER_GLOBAL_VAULT: usize = 208;
 }
 
@@ -55,7 +55,6 @@ pub struct MarketView {
     pub grace_period_seconds: u32,
     pub liquidation_keeper_bps: u16,
     pub liquidation_protocol_bps: u16,
-    pub curator_fee_bps: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -70,7 +69,7 @@ pub struct LoanView {
     pub matched_loan_sequence: u64,
     pub lender_kind: u8,
     pub lender_global_vault: Pubkey,
-    pub lender_profile_id: u8,
+    pub lender_sub_vault_id: u16,
     pub borrower_rate_bps: u16,
     pub lender_rate_bps: u16,
 }
@@ -98,7 +97,7 @@ pub struct OrderView {
     pub principal_atoms: u64,
     pub owner: Pubkey,
     pub owner_kind: u8,
-    pub risk_profile_id: u8,
+    pub sub_vault_id: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -133,40 +132,40 @@ impl PendingMatchedLoan {
 pub struct SeatView {
     pub owner: Pubkey,
     pub owner_kind: u8,
-    pub risk_profile_id: u8,
+    pub sub_vault_id: u16,
 }
 
 #[derive(Debug, Clone)]
-pub struct RiskProfileView {
+pub struct SubVaultView {
     pub vault: Pubkey,
     pub vault_mint: Pubkey,
     pub vault_bank: Pubkey,
-    pub profile_id: u8,
+    pub sub_vault_id: u16,
     pub curator: Pubkey,
     pub accumulated_curator_fee_atoms: u64,
     pub vault_is_paused: bool,
     /// Atoms retired by repay/liquidation/settle but not yet swept by
-    /// `claim_repayment_for_risk_profile`. Sum across all markets the
-    /// profile has been lending on; surfaced for cranker triage but the
+    /// `claim_repayment_for_sub_vault`. Sum across all markets the
+    /// sub_vault has been lending on; surfaced for cranker triage but the
     /// authoritative per-market source is the ClaimedSeat tree (see
     /// `PendingVaultClaim`).
     pub pending_claim_atoms: u64,
-    /// `true` when `profile.is_sunset == 1`. Sunset profiles still need
+    /// `true` when `sub_vault.is_sunset == 1`. Sunset sub_vaults still need
     /// claim sweeps and curator-fee claims; they only block deposits,
     /// new orders, order updates, and matches.
     pub is_sunset: bool,
 }
 
-/// A (market, vault, profile_id) triple with unsettled
+/// A (market, vault, sub_vault_id) triple with unsettled
 /// `debt_withdrawable_shares` on the vault-owned `ClaimedSeat`. One row
-/// per `claim_repayment_for_risk_profile` call the cranker should issue.
+/// per `claim_repayment_for_sub_vault` call the cranker should issue.
 #[derive(Debug, Clone)]
 pub struct PendingVaultClaim {
     pub market: Pubkey,
     pub debt_mint: Pubkey,
     pub debt_bank: Pubkey,
     pub lender_global_vault: Pubkey,
-    pub risk_profile_id: u8,
+    pub sub_vault_id: u16,
     pub debt_withdrawable_shares: u128,
 }
 
@@ -315,7 +314,7 @@ impl ChainReader {
             )),
             RpcFilterType::Memcmp(Memcmp::new(
                 loan_offsets::LENDER_KIND,
-                MemcmpEncodedBytes::Bytes(vec![OWNER_KIND_RISK_PROFILE]),
+                MemcmpEncodedBytes::Bytes(vec![OWNER_KIND_SUB_VAULT]),
             )),
         ];
         self.decode_loans(self.get_program_accounts(filters).await?)
@@ -348,7 +347,7 @@ impl ChainReader {
                 matched_loan_sequence: loan.matched_loan_sequence,
                 lender_kind: loan.lender_kind,
                 lender_global_vault: loan.lender_global_vault,
-                lender_profile_id: loan.lender_profile_id,
+                lender_sub_vault_id: loan.lender_sub_vault_id,
                 borrower_rate_bps: loan.borrower_rate_bps,
                 lender_rate_bps: loan.lender_rate_bps,
             });
@@ -400,11 +399,11 @@ impl ChainReader {
         Ok(SeatView {
             owner: seat.owner,
             owner_kind: seat.owner_kind,
-            risk_profile_id: seat.risk_profile_id,
+            sub_vault_id: seat.sub_vault_id,
         })
     }
 
-    pub async fn list_risk_profiles(&self) -> Result<Vec<RiskProfileView>> {
+    pub async fn list_sub_vaults(&self) -> Result<Vec<SubVaultView>> {
         let filters = vec![RpcFilterType::Memcmp(Memcmp::new(
             0,
             MemcmpEncodedBytes::Base58(
@@ -425,22 +424,22 @@ impl ChainReader {
             if header.discriminator != GLOBAL_VAULT_FIXED_DISCRIMINANT {
                 continue;
             }
-            if header.risk_profiles_root_index == NIL {
+            if header.sub_vaults_root_index == NIL {
                 continue;
             }
             let tree =
-                RiskProfileTreeReadOnly::new(dynamic, header.risk_profiles_root_index, NIL);
-            for (_idx, profile) in tree.iter::<RiskProfile>() {
-                out.push(RiskProfileView {
+                SubVaultTreeReadOnly::new(dynamic, header.sub_vaults_root_index, NIL);
+            for (_idx, sub_vault) in tree.iter::<SubVault>() {
+                out.push(SubVaultView {
                     vault: pk,
                     vault_mint: header.mint,
                     vault_bank: header.lending_pool,
-                    profile_id: profile.profile_id,
-                    curator: profile.curator,
-                    accumulated_curator_fee_atoms: profile.accumulated_curator_fee_atoms,
+                    sub_vault_id: sub_vault.sub_vault_id,
+                    curator: sub_vault.curator,
+                    accumulated_curator_fee_atoms: sub_vault.accumulated_curator_fee_atoms,
                     vault_is_paused: header.is_paused != 0,
-                    pending_claim_atoms: profile.pending_claim_atoms,
-                    is_sunset: profile.is_sunset != 0,
+                    pending_claim_atoms: sub_vault.pending_claim_atoms,
+                    is_sunset: sub_vault.is_sunset != 0,
                 });
             }
         }
@@ -449,13 +448,13 @@ impl ChainReader {
 
     /// Walks every market's ClaimedSeat tree and returns one row per
     /// vault-owned seat with `debt_withdrawable_shares > 0` — the set of
-    /// `(market, vault, profile_id)` triples the claimer should sweep.
+    /// `(market, vault, sub_vault_id)` triples the claimer should sweep.
     ///
     /// The on-chain processor reads shares (not atoms) off the seat, so
     /// this is the authoritative trigger: a non-zero share count is the
-    /// only signal that a sweep will move atoms. `RiskProfile.pending_claim_atoms`
+    /// only signal that a sweep will move atoms. `SubVault.pending_claim_atoms`
     /// is consistent with the sum of these shares' atom value but isn't
-    /// keyed per-market, so it can't drive the per-(profile, market)
+    /// keyed per-market, so it can't drive the per-(sub_vault, market)
     /// ix selection on its own.
     pub async fn list_pending_vault_claims(
         &self,
@@ -480,7 +479,7 @@ impl ChainReader {
             let tree =
                 ClaimedSeatTreeReadOnly::new(dynamic, fixed.claimed_seats_root_index, NIL);
             for (_idx, seat) in tree.iter::<ClaimedSeat>() {
-                if seat.owner_kind != OWNER_KIND_RISK_PROFILE {
+                if seat.owner_kind != OWNER_KIND_SUB_VAULT {
                     continue;
                 }
                 if seat.debt_withdrawable_shares == 0 {
@@ -491,7 +490,7 @@ impl ChainReader {
                     debt_mint: market.debt_mint,
                     debt_bank: market.debt_bank,
                     lender_global_vault: seat.owner,
-                    risk_profile_id: seat.risk_profile_id,
+                    sub_vault_id: seat.sub_vault_id,
                     debt_withdrawable_shares: seat.debt_withdrawable_shares,
                 });
             }
@@ -533,8 +532,33 @@ impl ChainReader {
             principal_atoms: order.principal_atoms,
             owner: seat.owner,
             owner_kind: seat.owner_kind,
-            risk_profile_id: seat.risk_profile_id,
+            sub_vault_id: seat.sub_vault_id,
         })
+    }
+
+    /// Cheap match-crank gate: `true` when the market's best resting bid
+    /// rate is at least the best resting ask rate (a rate-crossable pair
+    /// exists). The side-aware `*_best_index` points straight at each
+    /// side's best order, so this is a two-node read — no tree walk. The
+    /// program runs the full term / sub-vault-idle / LTV / self-cross
+    /// gates on the crank itself; this only filters the dominant
+    /// "not even rate-crossed" case so the cranker doesn't pay a fee per
+    /// market per tick.
+    pub async fn market_is_rate_crossed(&self, market: &Pubkey) -> Result<bool> {
+        let data = self
+            .rpc
+            .get_account_data(market)
+            .await?
+            .ok_or_else(|| anyhow!("market {market} not found"))?;
+        let (fixed, dynamic) = split_market(&data)?;
+        if fixed.bids_best_index == NIL || fixed.asks_best_index == NIL {
+            return Ok(false);
+        }
+        let best_bid =
+            ydelta::state::market::get_helper_order(dynamic, fixed.bids_best_index).get_value();
+        let best_ask =
+            ydelta::state::market::get_helper_order(dynamic, fixed.asks_best_index).get_value();
+        Ok(best_bid.rate_bps >= best_ask.rate_bps)
     }
 
     async fn get_program_accounts(
@@ -571,7 +595,6 @@ fn market_view_from_fixed(address: Pubkey, fixed: &MarketFixed) -> MarketView {
         grace_period_seconds: fixed.fee_config.grace_period_seconds,
         liquidation_keeper_bps: fixed.fee_config.liquidation_keeper_bps,
         liquidation_protocol_bps: fixed.fee_config.liquidation_protocol_bps,
-        curator_fee_bps: fixed.fee_config.curator_fee_bps,
     }
 }
 

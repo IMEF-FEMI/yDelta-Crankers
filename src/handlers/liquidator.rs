@@ -244,7 +244,7 @@ impl LiquidatorHandler {
         };
 
         // Fixed loans need the lender vault passed through so the full-settle
-        // close-out can decrement the risk profile + bump pending_claim_atoms.
+        // close-out can decrement the risk sub_vault + bump pending_claim_atoms.
         // P2Pool loans have no vault lender — must be None or the loader rejects.
         let settle_global_vault: Option<&Pubkey> = if loan.is_p2pool() {
             None
@@ -281,6 +281,19 @@ impl LiquidatorHandler {
         // update, and it only fires when sim already said yes.
         let mut real_bundle = swb_ixs;
         real_bundle.push(ix);
+        // Confirmatory sim of the ACTUAL settle ix (chosen repay_atoms_max +
+        // SWB prepend). The tag-35 check sim only proves the loan is
+        // settle-eligible, not that this repay size clears the on-chain
+        // partial-repay floor or the liquidator-balance require. Free, so
+        // skip rather than land a revert.
+        let confirm = ctx
+            .rpc
+            .simulate_v0(real_bundle.clone(), &swb_luts, &payer_pk)
+            .await?;
+        if !confirm.ok {
+            tracing::debug!(loan = %loan.address, error = ?confirm.error, "settle real-ix sim failed; skipping submit");
+            return Ok(false);
+        }
         let sig = ctx
             .rpc
             .send_signed_v0_labeled("settle_matured_loan", real_bundle, &swb_luts, &[&fee_payer])
@@ -365,7 +378,7 @@ impl LiquidatorHandler {
         };
 
         // Fixed loans need the lender vault passed through so the full-liquidate
-        // close-out can decrement the risk profile + bump pending_claim_atoms.
+        // close-out can decrement the risk sub_vault + bump pending_claim_atoms.
         // P2Pool loans have no vault lender — must be None or the loader rejects.
         let liquidate_global_vault: Option<&Pubkey> = if loan.is_p2pool() {
             None
@@ -400,6 +413,18 @@ impl LiquidatorHandler {
         // sim already confirmed the loan is liquidatable.
         let mut real_bundle = swb_ixs;
         real_bundle.push(ix);
+        // Confirmatory sim of the ACTUAL liquidate ix (chosen repay_atoms_max
+        // + SWB prepend): the tag-34 check sim proves LTV breach, not that
+        // this repay size clears the partial-repay floor or the
+        // liquidator-balance require. Free, so skip rather than land a revert.
+        let confirm = ctx
+            .rpc
+            .simulate_v0(real_bundle.clone(), &swb_luts, &payer_pk)
+            .await?;
+        if !confirm.ok {
+            tracing::debug!(loan = %loan.address, error = ?confirm.error, "liquidate real-ix sim failed; skipping submit");
+            return Ok(false);
+        }
         let sig = ctx
             .rpc
             .send_signed_v0_labeled("liquidate_loan", real_bundle, &swb_luts, &[&fee_payer])

@@ -10,8 +10,8 @@ use crate::config::{Config, KeypairSource};
 pub struct Signers {
     pub fee_payer: Arc<Keypair>,
     /// Curator pubkey → keypair. Empty unless `CURATOR_KEYPAIRS_JSON`
-    /// is set. The curator-fee-claimer resolves `profile.curator` here
-    /// and only submits for profiles whose key we hold.
+    /// is set. The curator-fee-claimer resolves `sub_vault.curator` here
+    /// and only submits for sub_vaults whose key we hold.
     pub curators: HashMap<Pubkey, Arc<Keypair>>,
 }
 

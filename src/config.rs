@@ -47,6 +47,10 @@ pub struct Config {
     pub handlers: HandlersConfig,
     pub thresholds: ThresholdsConfig,
     pub priority_fee_micro_lamports: u64,
+    /// CU limit requested on routine (promoter/claimer) txs. The priority
+    /// fee scales with this, so it's sized to observed usage with headroom
+    /// rather than the 1.4M ceiling. `COMPUTE_UNIT_LIMIT` to override.
+    pub compute_unit_limit: u32,
     pub min_signer_balance_lamports: u64,
     pub banks_refresh_interval: Duration,
     pub curator_keypairs_base58: Vec<String>,
@@ -58,11 +62,16 @@ pub struct HandlersConfig {
     pub claimer_enabled: bool,
     pub liquidator_enabled: bool,
     pub curator_fee_claimer_enabled: bool,
+    pub match_cranker_enabled: bool,
 
     pub promoter_interval: Duration,
     pub claimer_interval: Duration,
     pub liquidator_interval: Duration,
     pub curator_fee_claimer_interval: Duration,
+    pub match_cranker_interval: Duration,
+
+    /// Fill budget per `MatchCrank` call (`0` is treated as `1` on-chain).
+    pub match_cranker_max_fills: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -143,11 +152,15 @@ impl Config {
             claimer_enabled: bool_var("CLAIMER_ENABLED", true)?,
             liquidator_enabled: bool_var("LIQUIDATOR_ENABLED", true)?,
             curator_fee_claimer_enabled: bool_var("CURATOR_FEE_CLAIMER_ENABLED", false)?,
+            match_cranker_enabled: bool_var("MATCH_CRANKER_ENABLED", true)?,
 
             promoter_interval: secs_var("PROMOTER_INTERVAL_SEC", 5)?,
             claimer_interval: secs_var("CLAIMER_INTERVAL_SEC", 30)?,
             liquidator_interval: secs_var("LIQUIDATOR_INTERVAL_SEC", 10)?,
             curator_fee_claimer_interval: secs_var("CURATOR_FEE_CLAIMER_INTERVAL_SEC", 3_600)?,
+            match_cranker_interval: secs_var("MATCH_CRANKER_INTERVAL_SEC", 15)?,
+
+            match_cranker_max_fills: u32_var("MATCH_CRANKER_MAX_FILLS", 8)?,
         };
 
         let thresholds = ThresholdsConfig {
@@ -157,6 +170,10 @@ impl Config {
         };
 
         let priority_fee_micro_lamports = u64_var("PRIORITY_FEE_MICRO_LAMPORTS", 1_000)?;
+        // 400k covers observed promoter/claimer usage (~130–170k CU) with
+        // >2x headroom while cutting the priority fee vs the old hardcoded
+        // 1.4M. Liquidator txs use a separate, larger limit in `rpc.rs`.
+        let compute_unit_limit = u32_var("COMPUTE_UNIT_LIMIT", 400_000)?;
         let min_signer_balance_lamports = u64_var("MIN_SIGNER_BALANCE_LAMPORTS", 50_000_000)?;
         let banks_refresh_interval = secs_var("BANKS_REFRESH_SEC", 300)?;
 
@@ -177,6 +194,7 @@ impl Config {
             handlers,
             thresholds,
             priority_fee_micro_lamports,
+            compute_unit_limit,
             min_signer_balance_lamports,
             banks_refresh_interval,
             curator_keypairs_base58,
@@ -304,6 +322,13 @@ fn bool_var(name: &str, default: bool) -> Result<bool> {
 }
 
 fn u64_var(name: &str, default: u64) -> Result<u64> {
+    match std::env::var(name) {
+        Ok(v) => v.parse().map_err(|e| anyhow!("{name}: {e}")),
+        Err(_) => Ok(default),
+    }
+}
+
+fn u32_var(name: &str, default: u32) -> Result<u32> {
     match std::env::var(name) {
         Ok(v) => v.parse().map_err(|e| anyhow!("{name}: {e}")),
         Err(_) => Ok(default),

@@ -13,6 +13,7 @@ use crate::{chain_reader::ChainReader, rpc::Rpc, signer::Signers, swb_cranker::S
 pub mod claimer;
 pub mod curator_fee_claimer;
 pub mod liquidator;
+pub mod match_cranker;
 pub mod promoter;
 pub mod util;
 
@@ -129,4 +130,5 @@ pub fn spawn(handler: Arc<dyn Handler>, ctx: HandlerContext, interval: Duration)
 pub use claimer::ClaimerHandler;
 pub use curator_fee_claimer::CuratorFeeClaimerHandler;
 pub use liquidator::LiquidatorHandler;
+pub use match_cranker::MatchCrankerHandler;
 pub use promoter::PromoterHandler;

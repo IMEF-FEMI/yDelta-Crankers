@@ -7,18 +7,22 @@ chain-driven — `getProgramAccounts` against the ydelta program for
 markets and loans, plus in-place hypertree walks on `MarketFixed` for
 matched-loan queues. No indexer endpoint.
 
-The protocol moved to a **one-sided** model: only vault risk-profile
-asks rest on the book. Borrowers place IOC bids that either cross
-immediately, fall back to a `LoanType::P2Pool` marginfi-borrow node, or
-drop. Matches still queue async in `market.matched_loans` and need
-cranking.
+The protocol is **two-sided**: vault sub-vaults rest asks (priced as a
+spread over the live marginfi bank rate), and borrowers post bids that
+cross immediately, fall back to a `LoanType::P2Pool` marginfi-borrow
+node, rest on the book, or drop. A resting bid can sit **crossed at
+rest** — rate-crossable but unfilled because the ask's sub-vault had no
+idle, an LTV gate failed, etc. — and becomes fillable later with no order
+flow (a vault deposit replenishes idle, a repayment frees capacity, an
+oracle move flips an LTV gate). So besides the async `market.matched_loans`
+queue (promoter) there's a permissionless `MatchCrank` to resolve those.
 
 ## Cranking services
 
 This binary runs the following crankers against the on-chain yDelta
 program. Each handler is independent and gated by a `*_ENABLED` env
-flag. The first three are permissionless and sign with the fee payer;
-the fourth signs with per-curator keypairs.
+flag. All but the curator-fee-claimer are permissionless and sign with
+the fee payer; the curator-fee-claimer signs with per-curator keypairs.
 
 1. **`promoter`** — promotes new `MatchedLoan` queue entries into live
    `LoanFixed` PDAs (tag 5 `ProcessMatchedLoan`). One ix path: dispatch
@@ -38,31 +42,45 @@ the fourth signs with per-curator keypairs.
    floor) so an underfunded ATA never deadlocks a large loan. Same
    handler covers Fixed and P2Pool loan bodies — the program branches
    inside the processor.
-3. **`claimer`** — drains fully-repaid vault-funded loans back to the
-   GlobalVault (tag 20 `ClaimRepaymentForRiskProfile`). Recovers the
-   rent the promoter paid via the `cranker_refund` slot. Discovery is
-   permissionless and curator-config-free: one
-   `getProgramAccounts(LoanFixed, state=Repaid, lender_kind=RiskProfile)`
-   per tick, client-side filtered by `now >= matures_at_unix`.
+3. **`claimer`** — sweeps a sub-vault's realized `pending_claim_atoms`
+   from a market's lender marginfi account back into the vault's
+   integration account (tag 20 `ClaimRepaymentForSubVault`). v1 semantics:
+   the claim is a per-(market, sub-vault) **sweep**, not a per-loan close
+   — it reads no loan PDA. Loan-PDA close + the promoter's rent refund
+   happen inside `repay` / `settle` / `liquidate`, not here. Discovery is
+   one `getProgramAccounts(GlobalVaultFixed)` for sub-vaults with
+   `pending_claim_atoms > 0`, then each market's `ClaimedSeat` tree to
+   route the sweep to the markets actually holding the shares. A
+   share-level no-progress guard skips dust seats the marginfi withdraw
+   rounds to zero.
 4. **`curator_fee_claimer`** *(opt-in)* — drains
-   `RiskProfile.accumulated_curator_fee_atoms` to each curator's wallet
+   `SubVault.accumulated_curator_fee_atoms` to each curator's wallet
    ATA on a configurable cadence (default 1h, tag 15
    `ClaimCuratorFee`). Signs with the per-curator keypair loaded from
    `CURATOR_KEYPAIRS_JSON`. Discovery: one
    `getProgramAccounts(GlobalVaultFixed)` per tick plus an in-place
-   walk of each vault's `risk_profiles` tree; skips profiles whose
-   curator key we don't hold and profiles below
+   walk of each vault's `sub_vaults` tree; skips sub-vaults whose
+   curator key we don't hold and sub-vaults below
    `MIN_CURATOR_FEE_CLAIM_ATOMS`.
+5. **`match_cranker`** — resolves crossed-at-rest books (tag 43
+   `MatchCrank`, v1 D7/D8). Per non-paused market, gated on best-bid rate
+   ≥ best-ask rate (a rate-crossable pair); the program runs the full
+   term / sub-vault-idle / LTV / owner-self-cross checks on the crank
+   itself. Bundles a fresh Switchboard pull-feed update (the per-cross
+   LTV gate reads both bank oracles) and sims before submitting. Up to
+   `MATCH_CRANKER_MAX_FILLS` crosses per call. Permissionless; pays only
+   tx fees.
 
 | Handler | Instructions | Sim gate | Signer | Permissionless? |
 |---|---|---|---|---|
 | `promoter` | tag 5 | — | fee payer | yes |
 | `liquidator` | tag 16, 17 | tag 34, 35 | fee payer | yes |
 | `claimer` | tag 20 | — | fee payer | yes |
+| `match_cranker` | tag 43 | self (no fill detection) | fee payer | yes |
 | `curator_fee_claimer` | tag 15 | — | curator keypair | curator-gated |
 
-**Not cranker territory.** `PlaceOrderForRiskProfile` (tag 12),
-`CancelOrderForRiskProfile` (tag 13), and `UpdateOrderForRiskProfile`
+**Not cranker territory.** `PlaceOrderForSubVault` (tag 12),
+`CancelOrderForSubVault` (tag 13), and `UpdateOrderForSubVault`
 (tag 14) require `signer == profile.curator` *and* a live strategy
 decision — those are exclusively a UI concern. Same for
 `ConvertP2PoolToFixed` (tag 33), which requires the borrower signer.
@@ -85,12 +103,15 @@ discriminator plus targeted memcmps:
 
 - Markets — discriminator only (small set; cached 30s).
 - Loans for the liquidator — discriminator + `market` memcmp at offset 8.
-- Loans for the claimer — discriminator + `state == Repaid` (offset
-  196) + `lender_kind == RISK_PROFILE` (offset 201). One query covers
-  every vault, every profile, every market.
-- Matched-loan queues — read from the `MarketFixed` dynamic region
-  in-place via `hypertree` iterators that ship with the program crate,
-  so the on-disk layout can never drift.
+- Sub-vaults for the claimer + curator-fee-claimer — one
+  `getProgramAccounts(GlobalVaultFixed)` + an in-place walk of each
+  vault's `sub_vaults` tree. The claimer then walks each market's
+  `ClaimedSeat` tree to route per-(market, sub-vault) sweeps; no per-loan
+  scan.
+- Matched-loan queues + the resting-order books (best-bid/best-ask rate
+  cross for the match-cranker) — read from the `MarketFixed` dynamic
+  region in-place via `hypertree` iterators that ship with the program
+  crate, so the on-disk layout can never drift.
 
 When the LTV liquidator faces competitive pressure (third-party keepers
 racing for the bonus), swap the candidate source for a Geyser stream.
@@ -119,7 +140,8 @@ crankers/
         ├── util.rs              shared helpers (now_unix, P2Pool stage math)
         ├── promoter.rs          tag 5
         ├── liquidator.rs        tag 16 + 17 (sim 34, 35)
-        ├── claimer.rs           tag 20
+        ├── claimer.rs           tag 20 (per-sub-vault sweep)
+        ├── match_cranker.rs     tag 43 (crossed-at-rest resolver)
         └── curator_fee_claimer.rs   tag 15 (opt-in, per-curator signer)
 ```
 
@@ -197,14 +219,14 @@ Every handler talks to the RPC directly via `ChainReader`:
   refresh so newly-created markets surface without a restart.
 - `getProgramAccounts(ydelta, filter=LoanFixed-discrim + market memcmp)`
   — liquidator per-market scan.
-- `getProgramAccounts(ydelta, filter=LoanFixed-discrim + state=Repaid
-  + lender_kind=RiskProfile)` — claimer scan, single query covers
-  every vault.
 - `getProgramAccounts(ydelta, filter=GlobalVaultFixed-discrim)` —
-  curator-fee-claimer scan (in-place walk of each vault's
-  `risk_profiles` tree).
+  claimer + curator-fee-claimer scan (in-place walk of each vault's
+  `sub_vaults` tree). The claimer additionally walks each market's
+  `ClaimedSeat` tree (`getAccountInfo(market)`) to route per-(market,
+  sub-vault) sweeps.
 - `getAccountInfo(market)` — promoter (matched-loan queue walk +
-  defense-in-depth seat-kind check).
+  defense-in-depth seat-kind check); match-cranker (best-bid/best-ask
+  rate-cross gate before submitting a `MatchCrank`).
 
 Hypertree walks live in-process via the `hypertree` crate that ships
 alongside the program, so the on-disk layout can't drift.

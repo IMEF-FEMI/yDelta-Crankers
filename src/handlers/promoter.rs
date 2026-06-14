@@ -138,6 +138,24 @@ impl PromoterHandler {
             vault_settle,
         );
 
+        // Productive-crank gate: the queue node is removed on-chain only
+        // AFTER every check passes (net_principal>0, live seats, vault-settle
+        // funding), so a node that can't yet promote (e.g. the lender vault
+        // is momentarily underfunded) would otherwise be re-fired every
+        // tick. A free sim of the exact ix lets us skip instead of firing a
+        // doomed tx — and keeps the crank productive even if the send path
+        // ever drops RPC preflight.
+        let sim = ctx.rpc.simulate(vec![ix.clone()], &payer_pk).await?;
+        if !sim.ok {
+            tracing::debug!(
+                market = %market_pk,
+                seq = entry.sequence,
+                error = ?sim.error,
+                "process_matched_loan sim failed; skipping submit"
+            );
+            return Ok(false);
+        }
+
         let sig = ctx
             .rpc
             .send_signed_labeled("process_matched_loan", vec![ix], &[&fee_payer])
@@ -177,7 +195,7 @@ impl PromoterHandler {
         let seat = ctx
             .chain
             .read_seat_at(&market_data, entry.lender_seat_index)?;
-        if seat.owner_kind != ydelta::state::OWNER_KIND_RISK_PROFILE {
+        if seat.owner_kind != ydelta::state::OWNER_KIND_SUB_VAULT {
             tracing::warn!(
                 market = %market,
                 sequence = entry.sequence,
@@ -201,10 +219,11 @@ impl PromoterHandler {
         let (global_vault_staging, _) = global_vault_staging_pda(global_vault);
         let (global_vault_integration_account, _) =
             global_vault_integration_account_pda(global_vault);
-        let (expected_vault, _) = global_vault_pda(debt_mint);
+        let (expected_vault, _) = global_vault_pda(&debt_bank.bank);
         if expected_vault != *global_vault {
             return Err(anyhow!(
-                "vault {global_vault} doesn't match debt_mint {debt_mint} PDA {expected_vault}"
+                "vault {global_vault} doesn't match bank {} PDA {expected_vault}",
+                debt_bank.bank
             ));
         }
         let (market_debt_vault, _) = get_vault_address(market, debt_mint);
