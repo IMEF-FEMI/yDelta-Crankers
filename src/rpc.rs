@@ -246,7 +246,16 @@ impl Rpc {
         ixs: Vec<Instruction>,
         fee_payer: &Pubkey,
     ) -> Result<SimulationResult> {
-        self.simulate_v0(ixs, &[], fee_payer).await
+        // Mirror the send path (send_signed_labeled): prepend the compute-budget
+        // preamble so the sim runs under the SAME CU limit the real tx will.
+        // Without it, a heavy ix like process_matched_loan (marginfi CPIs) blows
+        // the default 200k CU in sim and fails ProgramFailedToComplete, making
+        // the productive-crank gate skip a send that would have succeeded at the
+        // configured limit. simulate_v0 stays bare — its Switchboard callers
+        // build their own bundle and manage instruction indices.
+        let mut all_ixs = self.priority_fee_preamble(self.compute_unit_limit);
+        all_ixs.extend(ixs);
+        self.simulate_v0(all_ixs, &[], fee_payer).await
     }
 
     /// v0-message simulate with optional Address Lookup Tables. Used by
